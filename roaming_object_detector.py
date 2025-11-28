@@ -54,8 +54,11 @@ if '--keyboard' in args:
 # Roaming parameters
 ROAM_SPEED = 30  # Forward speed (0-100)
 TURN_SPEED = 40  # Turning speed
-MIN_OBSTACLE_DISTANCE = 25  # cm - stop/turn when obstacle is closer
-CRITICAL_DISTANCE = 10  # cm - immediate stop and reverse
+BACKUP_SPEED = 25  # Reverse speed
+MIN_OBSTACLE_DISTANCE = 35  # cm - stop/turn when obstacle is closer
+CRITICAL_DISTANCE = 15  # cm - immediate stop and reverse
+CAR_WIDTH = 45  # cm - car is about 1.5ft (45cm) wide, need this much clearance
+SAFE_CLEARANCE = 60  # cm - comfortable clearance to navigate around obstacles
 
 # Object detection parameters
 DETECTION_INTERVAL = 2.0  # seconds between object detection scans
@@ -424,6 +427,106 @@ def object_detection_loop():
 # ============================================================================
 # Roaming Logic
 # ============================================================================
+def scan_for_clearance():
+    """Scan left, center, and right to find distances. Returns (left, center, right) distances."""
+    # Look left
+    my_car.set_cam_pan_angle(60)
+    time.sleep(0.3)
+    left_distance = my_car.get_distance()
+    if left_distance < 0:
+        left_distance = 999  # No obstacle = clear
+    
+    # Look center
+    my_car.set_cam_pan_angle(0)
+    time.sleep(0.3)
+    center_distance = my_car.get_distance()
+    if center_distance < 0:
+        center_distance = 999
+    
+    # Look right
+    my_car.set_cam_pan_angle(-60)
+    time.sleep(0.3)
+    right_distance = my_car.get_distance()
+    if right_distance < 0:
+        right_distance = 999
+    
+    # Reset camera
+    my_car.set_cam_pan_angle(0)
+    
+    return left_distance, center_distance, right_distance
+
+def find_safe_path():
+    """
+    Scan surroundings and find the safest path.
+    Returns turn angle (positive=left, negative=right) or None if stuck.
+    """
+    left_dist, center_dist, right_dist = scan_for_clearance()
+    
+    gray_print(f"Scan results - Left: {left_dist}cm, Center: {center_dist}cm, Right: {right_dist}cm")
+    
+    # Check if we have enough clearance (considering car width of ~45cm)
+    left_clear = left_dist >= SAFE_CLEARANCE
+    right_clear = right_dist >= SAFE_CLEARANCE
+    center_clear = center_dist >= SAFE_CLEARANCE
+    
+    if center_clear:
+        # Center is clear, go straight
+        return 0
+    elif left_clear and right_clear:
+        # Both sides clear, pick the more open one
+        if left_dist > right_dist:
+            return 35  # Turn left
+        else:
+            return -35  # Turn right
+    elif left_clear:
+        return 35  # Turn left
+    elif right_clear:
+        return -35  # Turn right
+    else:
+        # Neither side has enough clearance - need to back up more
+        return None
+
+def backup_and_navigate():
+    """Back up from obstacle and find a safe path around it."""
+    gray_print("Backing up to get clearance...")
+    
+    # Back up to get some distance from the obstacle
+    my_car.set_dir_servo_angle(0)
+    my_car.backward(BACKUP_SPEED)
+    time.sleep(0.8)
+    my_car.stop()
+    time.sleep(0.2)
+    
+    # Try to find a safe path
+    for attempt in range(3):  # Try up to 3 times
+        turn_angle = find_safe_path()
+        
+        if turn_angle is not None:
+            gray_print(f"Found path! Turning {turn_angle} degrees")
+            
+            # Execute the turn
+            my_car.set_dir_servo_angle(turn_angle)
+            my_car.forward(ROAM_SPEED)
+            time.sleep(1.0)  # Turn for a full second to get around obstacle
+            my_car.set_dir_servo_angle(0)
+            return True
+        else:
+            # Still stuck - back up more
+            gray_print(f"Attempt {attempt + 1}: Still blocked, backing up more...")
+            my_car.backward(BACKUP_SPEED)
+            time.sleep(0.6)
+            my_car.stop()
+            time.sleep(0.2)
+    
+    # After 3 attempts, try a sharp turn as last resort
+    gray_print("Path blocked - executing sharp turn to escape")
+    turn_direction = random.choice([-1, 1])
+    my_car.set_dir_servo_angle(35 * turn_direction)
+    my_car.forward(ROAM_SPEED)
+    time.sleep(1.5)
+    my_car.set_dir_servo_angle(0)
+    return True
+
 def roam_step():
     """Execute one step of roaming behavior with obstacle avoidance."""
     if not state.roaming or state.speaking:
@@ -437,8 +540,8 @@ def roam_step():
         # Ultrasonic sensors return -1 or -2 when nothing is in range (typically >400cm)
         if distance < 0:
             # No obstacle detected - safe to proceed
-            if random.random() < 0.1:  # 10% chance to make a slight turn
-                slight_turn = random.randint(-10, 10)
+            if random.random() < 0.1:  # 10% chance to make a slight turn for exploration
+                slight_turn = random.randint(-15, 15)
                 my_car.set_dir_servo_angle(slight_turn)
             else:
                 my_car.set_dir_servo_angle(0)
@@ -446,57 +549,23 @@ def roam_step():
             return
         
         if distance < CRITICAL_DISTANCE:
-            # Critical! Reverse immediately
-            gray_print(f"Critical distance: {distance}cm - reversing!")
-            my_car.backward(TURN_SPEED)
-            time.sleep(0.5)
+            # Critical! Stop immediately and back up
+            gray_print(f"⚠️ Critical distance: {distance}cm - emergency backup!")
             my_car.stop()
-            
-            # Random turn to find new path
-            turn_angle = random.choice([-30, 30])
-            my_car.set_dir_servo_angle(turn_angle)
-            my_car.forward(ROAM_SPEED)
-            time.sleep(0.8)
-            my_car.set_dir_servo_angle(0)
+            time.sleep(0.1)
+            backup_and_navigate()
             
         elif distance < MIN_OBSTACLE_DISTANCE:
-            # Obstacle ahead - slow down and turn
-            gray_print(f"Obstacle at {distance}cm - turning")
+            # Obstacle ahead - stop, back up, and find a path around it
+            gray_print(f"🚧 Obstacle detected at {distance}cm")
             my_car.stop()
-            time.sleep(0.2)
-            
-            # Look left and right to find best path
-            my_car.set_cam_pan_angle(45)
-            time.sleep(0.3)
-            left_distance = my_car.get_distance()
-            # Negative means no obstacle - treat as max distance
-            if left_distance < 0:
-                left_distance = 999
-            
-            my_car.set_cam_pan_angle(-45)
-            time.sleep(0.3)
-            right_distance = my_car.get_distance()
-            # Negative means no obstacle - treat as max distance
-            if right_distance < 0:
-                right_distance = 999
-            
-            my_car.set_cam_pan_angle(0)  # Reset camera
-            
-            # Turn toward the more open direction
-            if left_distance > right_distance:
-                turn_angle = 25
-            else:
-                turn_angle = -25
-            
-            my_car.set_dir_servo_angle(turn_angle)
-            my_car.forward(ROAM_SPEED)
-            time.sleep(0.6)
-            my_car.set_dir_servo_angle(0)
+            time.sleep(0.1)
+            backup_and_navigate()
             
         else:
             # Path is clear - proceed forward with slight random variations
-            if random.random() < 0.1:  # 10% chance to make a slight turn
-                slight_turn = random.randint(-10, 10)
+            if random.random() < 0.08:  # 8% chance to make a slight turn for exploration
+                slight_turn = random.randint(-12, 12)
                 my_car.set_dir_servo_angle(slight_turn)
             else:
                 my_car.set_dir_servo_angle(0)
