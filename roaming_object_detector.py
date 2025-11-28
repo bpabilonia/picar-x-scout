@@ -58,7 +58,11 @@ BACKUP_SPEED = 25  # Reverse speed
 MIN_OBSTACLE_DISTANCE = 35  # cm - stop/turn when obstacle is closer
 CRITICAL_DISTANCE = 15  # cm - immediate stop and reverse
 CAR_WIDTH = 45  # cm - car is about 1.5ft (45cm) wide, need this much clearance
-SAFE_CLEARANCE = 60  # cm - comfortable clearance to navigate around obstacles
+SAFE_CLEARANCE = 50  # cm - clearance needed to navigate around obstacles
+
+# Stuck detection parameters
+STUCK_DISTANCE_THRESHOLD = 5  # cm - if distance changes less than this, we might be stuck
+STUCK_CHECK_COUNT = 3  # Number of consecutive "no progress" readings before declaring stuck
 
 # Object detection parameters
 DETECTION_INTERVAL = 2.0  # seconds between object detection scans
@@ -225,6 +229,9 @@ class RobotState:
         self._detecting = False
         self._last_detection = None
         self._conversation_mode = False
+        self._last_distance = -1  # For stuck detection
+        self._stuck_counter = 0  # Count consecutive no-progress readings
+        self._last_progress_time = time.time()  # Track when we last made progress
     
     @property
     def roaming(self):
@@ -427,6 +434,88 @@ def object_detection_loop():
 # ============================================================================
 # Roaming Logic
 # ============================================================================
+def check_if_stuck(current_distance):
+    """
+    Check if the car is stuck (wheels spinning but not making progress).
+    Returns True if stuck, False otherwise.
+    """
+    if current_distance < 0:
+        # No obstacle detected - we're making progress into open space
+        state._stuck_counter = 0
+        state._last_distance = current_distance
+        state._last_progress_time = time.time()
+        return False
+    
+    # Check if distance has changed significantly
+    if state._last_distance > 0:
+        distance_change = abs(current_distance - state._last_distance)
+        
+        if distance_change < STUCK_DISTANCE_THRESHOLD:
+            # Distance hasn't changed much - might be stuck
+            state._stuck_counter += 1
+            gray_print(f"No progress detected ({state._stuck_counter}/{STUCK_CHECK_COUNT}) - distance: {current_distance}cm")
+            
+            if state._stuck_counter >= STUCK_CHECK_COUNT:
+                gray_print("🚨 STUCK DETECTED! Wheels spinning but no progress!")
+                return True
+        else:
+            # Making progress
+            state._stuck_counter = 0
+            state._last_progress_time = time.time()
+    
+    state._last_distance = current_distance
+    return False
+
+def aggressive_escape():
+    """
+    Perform an aggressive escape maneuver when stuck.
+    Backs up with turning to wiggle free, then finds a new path.
+    """
+    gray_print("🔄 Executing aggressive escape maneuver...")
+    state._stuck_counter = 0  # Reset stuck counter
+    
+    # Stop first
+    my_car.stop()
+    time.sleep(0.2)
+    
+    # Wiggle backward - alternate turning while reversing to break free
+    for i in range(3):
+        turn = 30 if i % 2 == 0 else -30
+        my_car.set_dir_servo_angle(turn)
+        my_car.backward(BACKUP_SPEED + 10)  # A bit faster
+        time.sleep(0.5)
+    
+    my_car.stop()
+    my_car.set_dir_servo_angle(0)
+    time.sleep(0.3)
+    
+    # Now scan and find the most open direction
+    left_dist, center_dist, right_dist = scan_for_clearance()
+    
+    # Find the most open direction
+    max_dist = max(left_dist, center_dist, right_dist)
+    
+    if max_dist == left_dist:
+        escape_angle = 40
+        gray_print(f"Escaping LEFT (clearance: {left_dist}cm)")
+    elif max_dist == right_dist:
+        escape_angle = -40
+        gray_print(f"Escaping RIGHT (clearance: {right_dist}cm)")
+    else:
+        # Center is best but we were stuck going forward, so pick a random side
+        escape_angle = random.choice([40, -40])
+        gray_print(f"Escaping with random turn (center was best at {center_dist}cm)")
+    
+    # Execute a strong turn to get away from the obstacle
+    my_car.set_dir_servo_angle(escape_angle)
+    my_car.forward(ROAM_SPEED)
+    time.sleep(1.5)  # Long turn to really get around
+    my_car.set_dir_servo_angle(0)
+    
+    # Reset tracking
+    state._last_distance = -1
+    state._stuck_counter = 0
+
 def scan_for_clearance():
     """Scan left, center, and right to find distances. Returns (left, center, right) distances."""
     # Look left
@@ -536,6 +625,11 @@ def roam_step():
         # Get ultrasonic distance
         distance = my_car.get_distance()
         
+        # Check if we're stuck (wheels spinning but no progress)
+        if check_if_stuck(distance):
+            aggressive_escape()
+            return
+        
         # Negative values mean no object detected (out of range) - path is clear!
         # Ultrasonic sensors return -1 or -2 when nothing is in range (typically >400cm)
         if distance < 0:
@@ -554,6 +648,9 @@ def roam_step():
             my_car.stop()
             time.sleep(0.1)
             backup_and_navigate()
+            # Reset stuck detection after maneuver
+            state._stuck_counter = 0
+            state._last_distance = -1
             
         elif distance < MIN_OBSTACLE_DISTANCE:
             # Obstacle ahead - stop, back up, and find a path around it
@@ -561,9 +658,12 @@ def roam_step():
             my_car.stop()
             time.sleep(0.1)
             backup_and_navigate()
+            # Reset stuck detection after maneuver
+            state._stuck_counter = 0
+            state._last_distance = -1
             
         else:
-            # Path is clear - proceed forward with slight random variations
+            # Path appears clear - proceed forward with slight random variations
             if random.random() < 0.08:  # 8% chance to make a slight turn for exploration
                 slight_turn = random.randint(-12, 12)
                 my_car.set_dir_servo_angle(slight_turn)
