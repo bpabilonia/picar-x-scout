@@ -433,11 +433,16 @@ def roam_step():
         # Get ultrasonic distance
         distance = my_car.get_distance()
         
-        if distance <= 0:
-            # Invalid sensor reading - stop for safety
-            gray_print(f"Invalid sensor reading: {distance}cm - stopping for safety")
-            my_car.stop()
-            time.sleep(0.5)
+        # Negative values mean no object detected (out of range) - path is clear!
+        # Ultrasonic sensors return -1 or -2 when nothing is in range (typically >400cm)
+        if distance < 0:
+            # No obstacle detected - safe to proceed
+            if random.random() < 0.1:  # 10% chance to make a slight turn
+                slight_turn = random.randint(-10, 10)
+                my_car.set_dir_servo_angle(slight_turn)
+            else:
+                my_car.set_dir_servo_angle(0)
+            my_car.forward(ROAM_SPEED)
             return
         
         if distance < CRITICAL_DISTANCE:
@@ -464,10 +469,16 @@ def roam_step():
             my_car.set_cam_pan_angle(45)
             time.sleep(0.3)
             left_distance = my_car.get_distance()
+            # Negative means no obstacle - treat as max distance
+            if left_distance < 0:
+                left_distance = 999
             
             my_car.set_cam_pan_angle(-45)
             time.sleep(0.3)
             right_distance = my_car.get_distance()
+            # Negative means no obstacle - treat as max distance
+            if right_distance < 0:
+                right_distance = 999
             
             my_car.set_cam_pan_angle(0)  # Reset camera
             
