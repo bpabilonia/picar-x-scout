@@ -61,8 +61,9 @@ CAR_WIDTH = 45  # cm - car is about 1.5ft (45cm) wide, need this much clearance
 SAFE_CLEARANCE = 50  # cm - clearance needed to navigate around obstacles
 
 # Stuck detection parameters
-STUCK_DISTANCE_THRESHOLD = 5  # cm - if distance changes less than this, we might be stuck
-STUCK_CHECK_COUNT = 3  # Number of consecutive "no progress" readings before declaring stuck
+STUCK_DISTANCE_THRESHOLD = 8  # cm - if distance changes less than this, we might be stuck
+STUCK_CHECK_COUNT = 2  # Number of consecutive "no progress" readings before declaring stuck
+MAX_STUCK_ESCAPES = 3  # After this many escapes in a row, do a 180° turn
 
 # Object detection parameters
 DETECTION_INTERVAL = 2.0  # seconds between object detection scans
@@ -232,6 +233,8 @@ class RobotState:
         self._last_distance = -1  # For stuck detection
         self._stuck_counter = 0  # Count consecutive no-progress readings
         self._last_progress_time = time.time()  # Track when we last made progress
+        self._escape_counter = 0  # Count consecutive escape attempts
+        self._last_escape_time = 0  # Track when we last escaped
     
     @property
     def roaming(self):
@@ -437,31 +440,48 @@ def object_detection_loop():
 def check_if_stuck(current_distance):
     """
     Check if the car is stuck (wheels spinning but not making progress).
+    Uses both distance change detection AND time-based detection.
     Returns True if stuck, False otherwise.
     """
+    current_time = time.time()
+    
     if current_distance < 0:
         # No obstacle detected - we're making progress into open space
         state._stuck_counter = 0
         state._last_distance = current_distance
-        state._last_progress_time = time.time()
+        state._last_progress_time = current_time
         return False
     
-    # Check if distance has changed significantly
+    # Time-based stuck detection: if no real progress in 5+ seconds, we're stuck
+    time_since_progress = current_time - state._last_progress_time
+    if time_since_progress > 5.0 and state._last_distance > 0:
+        avg_distance_change = abs(current_distance - state._last_distance)
+        if avg_distance_change < 20:  # Haven't moved more than 20cm in 5 seconds
+            gray_print(f"🚨 TIME-BASED STUCK DETECTED! No significant progress in {time_since_progress:.1f}s")
+            state._last_progress_time = current_time  # Reset to prevent spam
+            return True
+    
+    # Distance-based stuck detection
     if state._last_distance > 0:
         distance_change = abs(current_distance - state._last_distance)
         
         if distance_change < STUCK_DISTANCE_THRESHOLD:
             # Distance hasn't changed much - might be stuck
             state._stuck_counter += 1
-            gray_print(f"No progress detected ({state._stuck_counter}/{STUCK_CHECK_COUNT}) - distance: {current_distance}cm")
+            gray_print(f"No progress ({state._stuck_counter}/{STUCK_CHECK_COUNT}) - distance: {current_distance:.1f}cm, change: {distance_change:.1f}cm")
             
             if state._stuck_counter >= STUCK_CHECK_COUNT:
                 gray_print("🚨 STUCK DETECTED! Wheels spinning but no progress!")
+                state._last_progress_time = current_time  # Reset timer
                 return True
         else:
-            # Making progress
+            # Making progress - reset counter and update progress time
+            if distance_change > 15:  # Significant movement
+                state._last_progress_time = current_time
             state._stuck_counter = 0
-            state._last_progress_time = time.time()
+    else:
+        # First reading - initialize
+        state._last_progress_time = current_time
     
     state._last_distance = current_distance
     return False
@@ -470,17 +490,56 @@ def aggressive_escape():
     """
     Perform an aggressive escape maneuver when stuck.
     Backs up with turning to wiggle free, then finds a new path.
+    Tracks escape attempts - if repeatedly stuck, does a 180° turn.
     """
-    gray_print("🔄 Executing aggressive escape maneuver...")
+    current_time = time.time()
+    
+    # Check if this is a repeated escape (within 10 seconds of last one)
+    if current_time - state._last_escape_time < 10:
+        state._escape_counter += 1
+        gray_print(f"🔄 Escape attempt #{state._escape_counter}")
+    else:
+        state._escape_counter = 1
+        gray_print("🔄 Executing aggressive escape maneuver...")
+    
+    state._last_escape_time = current_time
     state._stuck_counter = 0  # Reset stuck counter
     
     # Stop first
     my_car.stop()
     time.sleep(0.2)
     
-    # Wiggle backward - alternate turning while reversing to break free
-    for i in range(3):
-        turn = 30 if i % 2 == 0 else -30
+    # If we've tried to escape multiple times, do a 180° turn
+    if state._escape_counter >= MAX_STUCK_ESCAPES:
+        gray_print("⚠️ Repeatedly stuck - executing 180° turn to find new area!")
+        state._escape_counter = 0
+        
+        # Back up significantly
+        my_car.backward(BACKUP_SPEED + 10)
+        time.sleep(1.5)
+        my_car.stop()
+        time.sleep(0.2)
+        
+        # Do a full 180° turn (turn sharply for extended time)
+        turn_direction = random.choice([-1, 1])
+        my_car.set_dir_servo_angle(40 * turn_direction)
+        my_car.forward(TURN_SPEED)
+        time.sleep(3.0)  # Long turn for ~180°
+        my_car.set_dir_servo_angle(0)
+        my_car.stop()
+        time.sleep(0.2)
+        
+        # Go forward into new direction
+        my_car.forward(ROAM_SPEED)
+        time.sleep(1.0)
+        
+        # Reset tracking
+        state._last_distance = -1
+        return
+    
+    # Normal escape: Wiggle backward - alternate turning while reversing to break free
+    for i in range(4):  # More wiggles
+        turn = 35 if i % 2 == 0 else -35
         my_car.set_dir_servo_angle(turn)
         my_car.backward(BACKUP_SPEED + 10)  # A bit faster
         time.sleep(0.5)
@@ -492,25 +551,28 @@ def aggressive_escape():
     # Now scan and find the most open direction
     left_dist, center_dist, right_dist = scan_for_clearance()
     
-    # Find the most open direction
-    max_dist = max(left_dist, center_dist, right_dist)
+    # Find the most open direction (but NOT center - we were stuck going forward)
+    gray_print(f"Scan: Left={left_dist}cm, Center={center_dist}cm, Right={right_dist}cm")
     
-    if max_dist == left_dist:
+    # Avoid center since that's where we got stuck
+    if left_dist > right_dist:
         escape_angle = 40
         gray_print(f"Escaping LEFT (clearance: {left_dist}cm)")
-    elif max_dist == right_dist:
+    else:
         escape_angle = -40
         gray_print(f"Escaping RIGHT (clearance: {right_dist}cm)")
-    else:
-        # Center is best but we were stuck going forward, so pick a random side
-        escape_angle = random.choice([40, -40])
-        gray_print(f"Escaping with random turn (center was best at {center_dist}cm)")
     
     # Execute a strong turn to get away from the obstacle
     my_car.set_dir_servo_angle(escape_angle)
     my_car.forward(ROAM_SPEED)
-    time.sleep(1.5)  # Long turn to really get around
+    time.sleep(2.0)  # Even longer turn to really get around
     my_car.set_dir_servo_angle(0)
+    my_car.stop()
+    time.sleep(0.2)
+    
+    # Verify escape: check if distance has changed significantly
+    new_distance = my_car.get_distance()
+    gray_print(f"Post-escape distance check: {new_distance}cm")
     
     # Reset tracking
     state._last_distance = -1
