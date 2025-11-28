@@ -275,6 +275,66 @@ class RobotState:
     def last_detection(self, value):
         with self.lock:
             self._last_detection = value
+    
+    # Thread-safe stuck detection properties
+    @property
+    def stuck_counter(self):
+        with self.lock:
+            return self._stuck_counter
+    
+    @stuck_counter.setter
+    def stuck_counter(self, value):
+        with self.lock:
+            self._stuck_counter = value
+    
+    @property
+    def last_distance(self):
+        with self.lock:
+            return self._last_distance
+    
+    @last_distance.setter
+    def last_distance(self, value):
+        with self.lock:
+            self._last_distance = value
+    
+    @property
+    def last_progress_time(self):
+        with self.lock:
+            return self._last_progress_time
+    
+    @last_progress_time.setter
+    def last_progress_time(self, value):
+        with self.lock:
+            self._last_progress_time = value
+    
+    @property
+    def escape_counter(self):
+        with self.lock:
+            return self._escape_counter
+    
+    @escape_counter.setter
+    def escape_counter(self, value):
+        with self.lock:
+            self._escape_counter = value
+    
+    @property
+    def last_escape_time(self):
+        with self.lock:
+            return self._last_escape_time
+    
+    @last_escape_time.setter
+    def last_escape_time(self, value):
+        with self.lock:
+            self._last_escape_time = value
+    
+    def reset_stuck_detection(self):
+        """Thread-safe method to reset all stuck detection state."""
+        with self.lock:
+            self._stuck_counter = 0
+            self._last_distance = -1
+            self._escape_counter = 0
+            self._last_progress_time = time.time()
+            self._last_escape_time = 0  # Reset to 0 so first escape is always treated as fresh
 
 state = RobotState()
 
@@ -417,17 +477,30 @@ def object_detection_loop():
                     if summary:
                         speak(summary)
                     
-                    # Brief comment then continue exploring
-                    if conversation:
-                        time.sleep(0.3)
-                        speak("Interesting! Let me keep exploring.")
-                    
                     led.off()
                     
-                    # Resume roaming after announcement
-                    print("🚗 Resuming exploration...")
+                    # After detecting object, check if path is clear before resuming
+                    print("🔍 Checking path clearance after detection...")
+                    time.sleep(0.3)
+                    
+                    # Get current distance to see if we need to navigate around
+                    distance = my_car.get_distance()
+                    
+                    if distance >= 0 and distance < SAFE_CLEARANCE:
+                        # Object is in our path - need to navigate around it (includes 0cm = touching)
+                        print(f"⚠️ Detected object blocking path at {distance}cm - finding clear route")
+                        speak("Let me find a way around.")
+                        backup_and_navigate()
+                        # Reset stuck detection after maneuver
+                        state.stuck_counter = 0
+                        state.last_distance = -1
+                    else:
+                        # Path is clear or object is far away
+                        print("🚗 Path clear - resuming exploration...")
+                        if conversation:
+                            speak("Interesting! Let me keep exploring.")
+                    
                     time.sleep(0.5)
-                    # state.roaming remains True, so car continues
                     
         except Exception as e:
             print(f"Detection loop error: {e}")
@@ -447,43 +520,43 @@ def check_if_stuck(current_distance):
     
     if current_distance < 0:
         # No obstacle detected - we're making progress into open space
-        state._stuck_counter = 0
-        state._last_distance = current_distance
-        state._last_progress_time = current_time
+        state.stuck_counter = 0
+        state.last_distance = current_distance
+        state.last_progress_time = current_time
         return False
     
     # Time-based stuck detection: if no real progress in 5+ seconds, we're stuck
-    time_since_progress = current_time - state._last_progress_time
-    if time_since_progress > 5.0 and state._last_distance > 0:
-        avg_distance_change = abs(current_distance - state._last_distance)
+    time_since_progress = current_time - state.last_progress_time
+    if time_since_progress > 5.0 and state.last_distance >= 0:
+        avg_distance_change = abs(current_distance - state.last_distance)
         if avg_distance_change < 20:  # Haven't moved more than 20cm in 5 seconds
             gray_print(f"🚨 TIME-BASED STUCK DETECTED! No significant progress in {time_since_progress:.1f}s")
-            state._last_progress_time = current_time  # Reset to prevent spam
+            state.last_progress_time = current_time  # Reset to prevent spam
             return True
     
-    # Distance-based stuck detection
-    if state._last_distance > 0:
-        distance_change = abs(current_distance - state._last_distance)
+    # Distance-based stuck detection (>= 0 includes touching obstacle at 0cm)
+    if state.last_distance >= 0:
+        distance_change = abs(current_distance - state.last_distance)
         
         if distance_change < STUCK_DISTANCE_THRESHOLD:
             # Distance hasn't changed much - might be stuck
-            state._stuck_counter += 1
-            gray_print(f"No progress ({state._stuck_counter}/{STUCK_CHECK_COUNT}) - distance: {current_distance:.1f}cm, change: {distance_change:.1f}cm")
+            state.stuck_counter += 1
+            gray_print(f"No progress ({state.stuck_counter}/{STUCK_CHECK_COUNT}) - distance: {current_distance:.1f}cm, change: {distance_change:.1f}cm")
             
-            if state._stuck_counter >= STUCK_CHECK_COUNT:
+            if state.stuck_counter >= STUCK_CHECK_COUNT:
                 gray_print("🚨 STUCK DETECTED! Wheels spinning but no progress!")
-                state._last_progress_time = current_time  # Reset timer
+                state.last_progress_time = current_time  # Reset timer
                 return True
         else:
             # Making progress - reset counter and update progress time
             if distance_change > 15:  # Significant movement
-                state._last_progress_time = current_time
-            state._stuck_counter = 0
+                state.last_progress_time = current_time
+            state.stuck_counter = 0
     else:
         # First reading - initialize
-        state._last_progress_time = current_time
+        state.last_progress_time = current_time
     
-    state._last_distance = current_distance
+    state.last_distance = current_distance
     return False
 
 def aggressive_escape():
@@ -495,24 +568,24 @@ def aggressive_escape():
     current_time = time.time()
     
     # Check if this is a repeated escape (within 10 seconds of last one)
-    if current_time - state._last_escape_time < 10:
-        state._escape_counter += 1
-        gray_print(f"🔄 Escape attempt #{state._escape_counter}")
+    if current_time - state.last_escape_time < 10:
+        state.escape_counter += 1
+        gray_print(f"🔄 Escape attempt #{state.escape_counter}")
     else:
-        state._escape_counter = 1
+        state.escape_counter = 1
         gray_print("🔄 Executing aggressive escape maneuver...")
     
-    state._last_escape_time = current_time
-    state._stuck_counter = 0  # Reset stuck counter
+    state.last_escape_time = current_time
+    state.stuck_counter = 0  # Reset stuck counter
     
     # Stop first
     my_car.stop()
     time.sleep(0.2)
     
     # If we've tried to escape multiple times, do a 180° turn
-    if state._escape_counter >= MAX_STUCK_ESCAPES:
+    if state.escape_counter >= MAX_STUCK_ESCAPES:
         gray_print("⚠️ Repeatedly stuck - executing 180° turn to find new area!")
-        state._escape_counter = 0
+        state.escape_counter = 0
         
         # Back up significantly
         my_car.backward(BACKUP_SPEED + 10)
@@ -532,9 +605,10 @@ def aggressive_escape():
         # Go forward into new direction
         my_car.forward(ROAM_SPEED)
         time.sleep(1.0)
+        my_car.stop()  # Stop before returning to let roaming loop take over
         
         # Reset tracking
-        state._last_distance = -1
+        state.last_distance = -1
         return
     
     # Normal escape: Wiggle backward - alternate turning while reversing to break free
@@ -575,8 +649,8 @@ def aggressive_escape():
     gray_print(f"Post-escape distance check: {new_distance}cm")
     
     # Reset tracking
-    state._last_distance = -1
-    state._stuck_counter = 0
+    state.last_distance = -1
+    state.stuck_counter = 0
 
 def scan_for_clearance():
     """Scan left, center, and right to find distances. Returns (left, center, right) distances."""
@@ -605,6 +679,83 @@ def scan_for_clearance():
     my_car.set_cam_pan_angle(0)
     
     return left_distance, center_distance, right_distance
+
+def initial_clearance_check():
+    """
+    Check path clearance before starting to roam.
+    If path is blocked, find a clear direction first.
+    Returns True if ready to roam, False if stuck.
+    """
+    print("🔍 Checking initial path clearance...")
+    
+    # Scan all directions
+    left_dist, center_dist, right_dist = scan_for_clearance()
+    
+    print(f"   Left: {left_dist:.0f}cm | Center: {center_dist:.0f}cm | Right: {right_dist:.0f}cm")
+    
+    # Check if center (forward) path is clear
+    if center_dist >= SAFE_CLEARANCE:
+        print("✅ Forward path is clear!")
+        return True
+    
+    # Center is blocked - find the best direction
+    print(f"⚠️ Forward path blocked ({center_dist:.0f}cm) - finding clear route...")
+    
+    # Pick the most open direction
+    if left_dist >= SAFE_CLEARANCE or right_dist >= SAFE_CLEARANCE:
+        if left_dist > right_dist:
+            turn_angle = 35
+            direction = "LEFT"
+            clearance = left_dist
+        else:
+            turn_angle = -35
+            direction = "RIGHT"
+            clearance = right_dist
+        
+        print(f"🔄 Turning {direction} (clearance: {clearance:.0f}cm)")
+        
+        # Execute turn to face clear direction
+        my_car.set_dir_servo_angle(turn_angle)
+        my_car.forward(ROAM_SPEED)
+        time.sleep(1.5)
+        my_car.set_dir_servo_angle(0)
+        my_car.stop()
+        time.sleep(0.2)
+        
+        print("✅ Now facing clear path!")
+        return True
+    
+    # All directions blocked - back up first
+    print("🚧 All directions blocked - backing up...")
+    my_car.backward(BACKUP_SPEED)
+    time.sleep(1.0)
+    my_car.stop()
+    time.sleep(0.2)
+    
+    # Try again after backing up
+    left_dist, center_dist, right_dist = scan_for_clearance()
+    max_dist = max(left_dist, center_dist, right_dist)
+    
+    if max_dist >= SAFE_CLEARANCE:
+        if max_dist == left_dist:
+            turn_angle = 35
+        elif max_dist == right_dist:
+            turn_angle = -35
+        else:
+            turn_angle = 0
+        
+        if turn_angle != 0:
+            my_car.set_dir_servo_angle(turn_angle)
+            my_car.forward(ROAM_SPEED)
+            time.sleep(1.5)
+            my_car.set_dir_servo_angle(0)
+            my_car.stop()
+        
+        print("✅ Found clear path after backing up!")
+        return True
+    
+    print("❌ Could not find clear path - try repositioning the car")
+    return False
 
 def find_safe_path():
     """
@@ -660,6 +811,7 @@ def backup_and_navigate():
             my_car.forward(ROAM_SPEED)
             time.sleep(1.0)  # Turn for a full second to get around obstacle
             my_car.set_dir_servo_angle(0)
+            my_car.stop()  # Stop before returning to let roaming loop take over
             return True
         else:
             # Still stuck - back up more
@@ -676,6 +828,7 @@ def backup_and_navigate():
     my_car.forward(ROAM_SPEED)
     time.sleep(1.5)
     my_car.set_dir_servo_angle(0)
+    my_car.stop()  # Stop before returning to let roaming loop take over
     return True
 
 def roam_step():
@@ -711,8 +864,8 @@ def roam_step():
             time.sleep(0.1)
             backup_and_navigate()
             # Reset stuck detection after maneuver
-            state._stuck_counter = 0
-            state._last_distance = -1
+            state.stuck_counter = 0
+            state.last_distance = -1
             
         elif distance < MIN_OBSTACLE_DISTANCE:
             # Obstacle ahead - stop, back up, and find a path around it
@@ -721,8 +874,8 @@ def roam_step():
             time.sleep(0.1)
             backup_and_navigate()
             # Reset stuck detection after maneuver
-            state._stuck_counter = 0
-            state._last_distance = -1
+            state.stuck_counter = 0
+            state.last_distance = -1
             
         else:
             # Path appears clear - proceed forward with slight random variations
@@ -778,10 +931,18 @@ def voice_command_loop():
             elif wake_action == 'start':
                 if not state.roaming:
                     print("\n🚗 STARTING ROAM MODE")
-                    speak("Let's go exploring! I'll look for interesting things.")
+                    speak("Let me check my surroundings first.")
                     state.conversation_mode = False
-                    time.sleep(0.5)
-                    state.roaming = True
+                    time.sleep(0.3)
+                    
+                    # Check path clearance before starting
+                    if initial_clearance_check():
+                        speak("All clear! Let's go exploring!")
+                        # Reset stuck detection for fresh start (atomic)
+                        state.reset_stuck_detection()
+                        state.roaming = True
+                    else:
+                        speak("I can't find a clear path. Please move me to a better spot.")
                     
             elif state.conversation_mode or not state.roaming:
                 # In conversation mode or stopped - chat about what we see
@@ -854,9 +1015,17 @@ def keyboard_loop():
                 
             elif user_input.lower() == 'start':
                 print("🚗 Starting roam mode")
-                speak("Let's go exploring!")
-                time.sleep(0.5)
-                state.roaming = True
+                speak("Let me check my surroundings first.")
+                time.sleep(0.3)
+                
+                # Check path clearance before starting
+                if initial_clearance_check():
+                    speak("All clear! Let's go exploring!")
+                    # Reset stuck detection for fresh start (atomic)
+                    state.reset_stuck_detection()
+                    state.roaming = True
+                else:
+                    speak("I can't find a clear path. Please move me to a better spot.")
                 
             elif user_input.lower() == 'scan':
                 # Force an object scan
