@@ -519,10 +519,26 @@ def check_if_stuck(current_distance):
     current_time = time.time()
     
     if current_distance < 0:
-        # No obstacle detected - we're making progress into open space
-        state.stuck_counter = 0
+        # No obstacle detected (sensor returns negative when nothing in range)
+        # BUT the car could still be stuck on something the sensor can't see!
+        
+        # Check if we just transitioned from seeing an obstacle to open space
+        if state.last_distance >= 0:
+            # We moved from obstacle to open - this IS progress, reset timer
+            state.stuck_counter = 0
+            state.last_progress_time = current_time
+            gray_print("Cleared obstacle - now in open space")
+        else:
+            # We've been in "open space" continuously - but are we actually moving?
+            # Time-based stuck detection for negative readings
+            time_in_open = current_time - state.last_progress_time
+            if time_in_open > 7.0:  # If stuck in "open" for 7+ seconds, something's wrong
+                gray_print(f"🚨 STUCK IN OPEN SPACE! No obstacle detected for {time_in_open:.1f}s but car may not be moving")
+                state.last_progress_time = current_time  # Reset to prevent spam
+                state.last_distance = current_distance
+                return True
+        
         state.last_distance = current_distance
-        state.last_progress_time = current_time
         return False
     
     # Time-based stuck detection: if no real progress in 5+ seconds, we're stuck
@@ -549,9 +565,14 @@ def check_if_stuck(current_distance):
                 return True
         else:
             # Making progress - reset counter and update progress time
-            if distance_change > 15:  # Significant movement
-                state.last_progress_time = current_time
+            # Any movement beyond the stuck threshold counts as progress
+            state.last_progress_time = current_time
             state.stuck_counter = 0
+    elif state.last_distance < 0:
+        # Transitioned from open space to seeing an obstacle - this is progress!
+        state.stuck_counter = 0
+        state.last_progress_time = current_time
+        gray_print(f"Now detecting obstacle at {current_distance:.1f}cm")
     else:
         # First reading - initialize
         state.last_progress_time = current_time
@@ -737,12 +758,14 @@ def initial_clearance_check():
     max_dist = max(left_dist, center_dist, right_dist)
     
     if max_dist >= SAFE_CLEARANCE:
-        if max_dist == left_dist:
-            turn_angle = 35
-        elif max_dist == right_dist:
-            turn_angle = -35
+        # Priority: center (straight) > left > right
+        # Prefer going straight if center is equally clear
+        if max_dist == center_dist:
+            turn_angle = 0  # Go straight
+        elif max_dist == left_dist:
+            turn_angle = 35  # Turn left
         else:
-            turn_angle = 0
+            turn_angle = -35  # Turn right
         
         if turn_angle != 0:
             my_car.set_dir_servo_angle(turn_angle)
