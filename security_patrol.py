@@ -1142,14 +1142,15 @@ def get_key_nonblocking():
 def manual_drive_mode():
     """Enter manual drive mode with arrow key controls."""
     print("\n🎮 MANUAL DRIVE MODE")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  ↑/↓    Forward/Backward")
-    print("  ←/→    Turn Left/Right")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  ↑  Forward")
+    print("  ↓  Backward")
+    print("  ←  Turn Left")
+    print("  →  Turn Right")
     print("  SPACE  Stop")
-    print("  W      While-pressed mode (hold to move)")
-    print("  E      Continuous mode (keeps moving)")
-    print("  Q      Exit manual mode")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  Q  Exit manual mode")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Press arrow keys to drive. Car keeps moving until SPACE.\n")
     
     # Stop any automatic patrol
     was_patrolling = state.patrolling
@@ -1162,40 +1163,17 @@ def manual_drive_mode():
     steering_angle = 0      # -30 (left) to 30 (right)
     last_status = ""
     
-    # Drive mode: 'continuous' (E) or 'momentary' (W)
-    drive_mode = 'continuous'
-    last_key_time = time.time()
-    key_timeout = 0.15  # Seconds without key = stop in momentary mode
-    
-    print(f"[Mode: CONTINUOUS - car keeps moving until SPACE]\n")
-    
     try:
         while True:
             # Check for key input (non-blocking)
             key = get_key_nonblocking()
-            current_time = time.time()
             
             if key:
-                last_key_time = current_time
-                
                 if key == 'q' or key == 'Q':
                     print("\n🔒 Exiting manual drive mode")
                     my_car.stop()
                     my_car.set_dir_servo_angle(0)
                     break
-                
-                elif key == 'w' or key == 'W':  # Switch to momentary mode
-                    drive_mode = 'momentary'
-                    drive_direction = None
-                    print("\n[Mode: WHILE-PRESSED - hold arrows to move]")
-                    print("                              ", end='\r')
-                    last_status = ""
-                
-                elif key == 'e' or key == 'E':  # Switch to continuous mode
-                    drive_mode = 'continuous'
-                    print("\n[Mode: CONTINUOUS - car keeps moving until SPACE]")
-                    print("                              ", end='\r')
-                    last_status = ""
                 
                 elif key == '\x1b[A':  # Up arrow - Forward
                     drive_direction = 'forward'
@@ -1216,11 +1194,6 @@ def manual_drive_mode():
                 elif key == '\x03':  # Ctrl+C
                     raise KeyboardInterrupt
             
-            # In momentary mode, stop if no key pressed recently
-            if drive_mode == 'momentary':
-                if current_time - last_key_time > key_timeout:
-                    drive_direction = None
-            
             # Apply current drive state continuously
             my_car.set_dir_servo_angle(steering_angle)
             
@@ -1232,27 +1205,25 @@ def manual_drive_mode():
                 my_car.stop()
             
             # Update status display
-            mode_indicator = "⏸" if drive_mode == 'momentary' else "▶"
-            
             if drive_direction == 'forward':
                 if steering_angle < 0:
-                    status = f"{mode_indicator} ↖️  Forward + Left "
+                    status = "↖️  Forward + Left "
                 elif steering_angle > 0:
-                    status = f"{mode_indicator} ↗️  Forward + Right"
+                    status = "↗️  Forward + Right"
                 else:
-                    status = f"{mode_indicator} ⬆️  Forward        "
+                    status = "⬆️  Forward        "
             elif drive_direction == 'backward':
                 if steering_angle < 0:
-                    status = f"{mode_indicator} ↙️  Backward + Left "
+                    status = "↙️  Backward + Left "
                 elif steering_angle > 0:
-                    status = f"{mode_indicator} ↘️  Backward + Right"
+                    status = "↘️  Backward + Right"
                 else:
-                    status = f"{mode_indicator} ⬇️  Backward        "
+                    status = "⬇️  Backward        "
             else:
                 if steering_angle != 0:
-                    status = f"{mode_indicator} ⏹️  Stopped (turning)"
+                    status = "⏹️  Stopped (turning)"
                 else:
-                    status = f"{mode_indicator} ⏹️  Stopped          "
+                    status = "⏹️  Stopped          "
             
             if status != last_status:
                 print(status, end='\r')
