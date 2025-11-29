@@ -1,0 +1,29 @@
+# SLAM Navigation Dependencies for PiCar-X Scout
+# Install with: pip install -r requirements_slam.txt
+
+# Core dependencies (required)
+numpy>=1.20.0
+opencv-python>=4.5.0
+
+# Visualization (at least one recommended)
+matplotlib>=3.4.0
+pygame>=2.0.0
+
+# LIDAR support (optional - for RPLIDAR)
+rplidar>=0.9.5
+
+# ROS dependencies (optional - install via ROS, not pip)
+# rospy
+# nav_msgs
+# sensor_msgs
+# geometry_msgs
+# tf
+
+# PiCar-X dependencies (install on Raspberry Pi)
+# picarx
+# robot_hat
+# vilib
+
+# Additional utilities
+scipy>=1.7.0  # For path smoothing
+
