@@ -1127,14 +1127,14 @@ def manual_drive_mode():
     """Enter manual drive mode with arrow key controls."""
     print("\n🎮 MANUAL DRIVE MODE")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  ↑  Forward")
-    print("  ↓  Backward")
+    print("  ↑  Forward (hold to drive)")
+    print("  ↓  Backward (hold to drive)")
     print("  ←  Turn Left")
     print("  →  Turn Right")
     print("  SPACE  Stop")
     print("  Q  Exit manual mode")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Press any arrow key to start driving...\n")
+    print("Hold arrow keys to drive continuously...\n")
     
     # Stop any automatic patrol
     was_patrolling = state.patrolling
@@ -1142,7 +1142,7 @@ def manual_drive_mode():
     my_car.stop()
     my_car.set_dir_servo_angle(0)
     
-    current_direction = None
+    current_steering = 0  # Track steering angle
     
     try:
         while True:
@@ -1155,46 +1155,42 @@ def manual_drive_mode():
                 break
             
             elif key == '\x1b[A':  # Up arrow - Forward
-                if current_direction != 'forward':
-                    my_car.set_dir_servo_angle(0)
-                    my_car.forward(MANUAL_DRIVE_SPEED)
-                    current_direction = 'forward'
+                # Always send forward command (allows continuous driving while held)
+                my_car.set_dir_servo_angle(current_steering)
+                my_car.forward(MANUAL_DRIVE_SPEED)
+                if current_steering == 0:
                     print("⬆️  Forward ", end='\r')
+                elif current_steering > 0:
+                    print("↗️  Fwd+Left", end='\r')
+                else:
+                    print("↘️  Fwd+Right", end='\r')
             
             elif key == '\x1b[B':  # Down arrow - Backward
-                if current_direction != 'backward':
-                    my_car.set_dir_servo_angle(0)
-                    my_car.backward(MANUAL_DRIVE_SPEED)
-                    current_direction = 'backward'
+                # Always send backward command
+                my_car.set_dir_servo_angle(current_steering)
+                my_car.backward(MANUAL_DRIVE_SPEED)
+                if current_steering == 0:
                     print("⬇️  Backward", end='\r')
+                elif current_steering > 0:
+                    print("↙️  Bck+Left", end='\r')
+                else:
+                    print("↘️  Bck+Right", end='\r')
             
             elif key == '\x1b[D':  # Left arrow - Turn Left
-                my_car.set_dir_servo_angle(30)
-                if current_direction == 'forward':
-                    my_car.forward(MANUAL_DRIVE_SPEED)
-                elif current_direction == 'backward':
-                    my_car.backward(MANUAL_DRIVE_SPEED)
-                else:
-                    my_car.forward(MANUAL_DRIVE_SPEED)
-                    current_direction = 'forward'
-                print("⬅️  Left    ", end='\r')
+                current_steering = 30
+                my_car.set_dir_servo_angle(current_steering)
+                print("⬅️  Steering Left ", end='\r')
             
             elif key == '\x1b[C':  # Right arrow - Turn Right
-                my_car.set_dir_servo_angle(-30)
-                if current_direction == 'forward':
-                    my_car.forward(MANUAL_DRIVE_SPEED)
-                elif current_direction == 'backward':
-                    my_car.backward(MANUAL_DRIVE_SPEED)
-                else:
-                    my_car.forward(MANUAL_DRIVE_SPEED)
-                    current_direction = 'forward'
-                print("➡️  Right   ", end='\r')
+                current_steering = -30
+                my_car.set_dir_servo_angle(current_steering)
+                print("➡️  Steering Right", end='\r')
             
-            elif key == ' ':  # Space - Stop
+            elif key == ' ':  # Space - Stop and reset steering
                 my_car.stop()
                 my_car.set_dir_servo_angle(0)
-                current_direction = None
-                print("⏹️  Stopped ", end='\r')
+                current_steering = 0
+                print("⏹️  Stopped       ", end='\r')
             
             elif key == '\x03':  # Ctrl+C
                 raise KeyboardInterrupt
