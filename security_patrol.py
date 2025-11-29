@@ -642,10 +642,12 @@ def security_detection_loop():
                 
                 if intruders:
                     # INTRUDER DETECTED! Acquire car lock to prevent race with patrol loop
-                    state.handling_detection = True
                     speech_text = None
                     
                     try:
+                        # Set flag inside try block so finally always resets it
+                        state.handling_detection = True
+                        
                         # Phase 1: Car control operations (with lock)
                         with state.car_lock:
                             my_car.stop()  # Stop to capture clear image
@@ -655,7 +657,7 @@ def security_detection_loop():
                         state.increment_detections()
                         
                         # Get intruder names for logging
-                        intruder_names = [i['name'] for i in intruders]
+                        intruder_names = [i.get('name', 'Unknown') for i in intruders]
                         threat_levels = [i.get('threat_level', 'unknown') for i in intruders]
                         
                         print(f"\n🚨 SECURITY ALERT: {detection_type.upper()} DETECTED!")
@@ -723,7 +725,10 @@ def idle_timeout_loop():
                 
                 state.patrolling = False
                 state.paused_due_to_timeout = True
-                my_car.stop()
+                
+                # Acquire car lock to safely stop (prevent race with patrol/detection loops)
+                with state.car_lock:
+                    my_car.stop()
                 
                 speak(f"No activity detected for {int(IDLE_TIMEOUT_SECONDS/60)} minutes. "
                       f"Entering standby mode. Say 'Patrol' to resume.")
@@ -1102,39 +1107,49 @@ def voice_command_loop():
 # ============================================================================
 MANUAL_DRIVE_SPEED = 30  # Speed for manual control
 
-def get_key():
-    """Get a single keypress (including arrow keys) without waiting for Enter."""
+def get_key_nonblocking():
+    """Get a keypress without blocking. Returns None if no key pressed."""
     import sys
     import tty
     import termios
+    import select
     
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
-        # Check for escape sequence (arrow keys)
-        if ch == '\x1b':
-            ch2 = sys.stdin.read(1)
-            if ch2 == '[':
-                ch3 = sys.stdin.read(1)
-                return '\x1b[' + ch3  # Return full escape sequence
-        return ch
+        # Check if input is available (timeout 0.05 seconds)
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if rlist:
+            ch = sys.stdin.read(1)
+            # Check for escape sequence (arrow keys)
+            if ch == '\x1b':
+                # Check for more characters
+                rlist2, _, _ = select.select([sys.stdin], [], [], 0.01)
+                if rlist2:
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        rlist3, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        if rlist3:
+                            ch3 = sys.stdin.read(1)
+                            return '\x1b[' + ch3
+                return ch
+            return ch
+        return None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def manual_drive_mode():
     """Enter manual drive mode with arrow key controls."""
     print("\n🎮 MANUAL DRIVE MODE")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  ↑  Forward (hold to drive)")
-    print("  ↓  Backward (hold to drive)")
-    print("  ←  Turn Left")
-    print("  →  Turn Right")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  ↑/↓    Forward/Backward")
+    print("  ←/→    Turn Left/Right")
     print("  SPACE  Stop")
-    print("  Q  Exit manual mode")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("Hold arrow keys to drive continuously...\n")
+    print("  W      While-pressed mode (hold to move)")
+    print("  E      Continuous mode (keeps moving)")
+    print("  Q      Exit manual mode")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     # Stop any automatic patrol
     was_patrolling = state.patrolling
@@ -1142,58 +1157,106 @@ def manual_drive_mode():
     my_car.stop()
     my_car.set_dir_servo_angle(0)
     
-    current_steering = 0  # Track steering angle
+    # Drive state
+    drive_direction = None  # None, 'forward', 'backward'
+    steering_angle = 0      # -30 (left) to 30 (right)
+    last_status = ""
+    
+    # Drive mode: 'continuous' (E) or 'momentary' (W)
+    drive_mode = 'continuous'
+    last_key_time = time.time()
+    key_timeout = 0.15  # Seconds without key = stop in momentary mode
+    
+    print(f"[Mode: CONTINUOUS - car keeps moving until SPACE]\n")
     
     try:
         while True:
-            key = get_key()
+            # Check for key input (non-blocking)
+            key = get_key_nonblocking()
+            current_time = time.time()
             
-            if key == 'q' or key == 'Q':
-                print("\n🔒 Exiting manual drive mode")
-                my_car.stop()
-                my_car.set_dir_servo_angle(0)
-                break
+            if key:
+                last_key_time = current_time
+                
+                if key == 'q' or key == 'Q':
+                    print("\n🔒 Exiting manual drive mode")
+                    my_car.stop()
+                    my_car.set_dir_servo_angle(0)
+                    break
+                
+                elif key == 'w' or key == 'W':  # Switch to momentary mode
+                    drive_mode = 'momentary'
+                    drive_direction = None
+                    print("\n[Mode: WHILE-PRESSED - hold arrows to move]")
+                    print("                              ", end='\r')
+                    last_status = ""
+                
+                elif key == 'e' or key == 'E':  # Switch to continuous mode
+                    drive_mode = 'continuous'
+                    print("\n[Mode: CONTINUOUS - car keeps moving until SPACE]")
+                    print("                              ", end='\r')
+                    last_status = ""
+                
+                elif key == '\x1b[A':  # Up arrow - Forward
+                    drive_direction = 'forward'
+                
+                elif key == '\x1b[B':  # Down arrow - Backward
+                    drive_direction = 'backward'
+                
+                elif key == '\x1b[D':  # Left arrow - Turn Left
+                    steering_angle = -30
+                
+                elif key == '\x1b[C':  # Right arrow - Turn Right
+                    steering_angle = 30
+                
+                elif key == ' ':  # Space - Stop
+                    drive_direction = None
+                    steering_angle = 0
+                
+                elif key == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt
             
-            elif key == '\x1b[A':  # Up arrow - Forward
-                # Always send forward command (allows continuous driving while held)
-                my_car.set_dir_servo_angle(current_steering)
+            # In momentary mode, stop if no key pressed recently
+            if drive_mode == 'momentary':
+                if current_time - last_key_time > key_timeout:
+                    drive_direction = None
+            
+            # Apply current drive state continuously
+            my_car.set_dir_servo_angle(steering_angle)
+            
+            if drive_direction == 'forward':
                 my_car.forward(MANUAL_DRIVE_SPEED)
-                if current_steering == 0:
-                    print("⬆️  Forward ", end='\r')
-                elif current_steering > 0:
-                    print("↗️  Fwd+Left", end='\r')
-                else:
-                    print("↘️  Fwd+Right", end='\r')
-            
-            elif key == '\x1b[B':  # Down arrow - Backward
-                # Always send backward command
-                my_car.set_dir_servo_angle(current_steering)
+            elif drive_direction == 'backward':
                 my_car.backward(MANUAL_DRIVE_SPEED)
-                if current_steering == 0:
-                    print("⬇️  Backward", end='\r')
-                elif current_steering > 0:
-                    print("↙️  Bck+Left", end='\r')
-                else:
-                    print("↘️  Bck+Right", end='\r')
-            
-            elif key == '\x1b[D':  # Left arrow - Turn Left
-                current_steering = 30
-                my_car.set_dir_servo_angle(current_steering)
-                print("⬅️  Steering Left ", end='\r')
-            
-            elif key == '\x1b[C':  # Right arrow - Turn Right
-                current_steering = -30
-                my_car.set_dir_servo_angle(current_steering)
-                print("➡️  Steering Right", end='\r')
-            
-            elif key == ' ':  # Space - Stop and reset steering
+            else:
                 my_car.stop()
-                my_car.set_dir_servo_angle(0)
-                current_steering = 0
-                print("⏹️  Stopped       ", end='\r')
             
-            elif key == '\x03':  # Ctrl+C
-                raise KeyboardInterrupt
+            # Update status display
+            mode_indicator = "⏸" if drive_mode == 'momentary' else "▶"
+            
+            if drive_direction == 'forward':
+                if steering_angle < 0:
+                    status = f"{mode_indicator} ↖️  Forward + Left "
+                elif steering_angle > 0:
+                    status = f"{mode_indicator} ↗️  Forward + Right"
+                else:
+                    status = f"{mode_indicator} ⬆️  Forward        "
+            elif drive_direction == 'backward':
+                if steering_angle < 0:
+                    status = f"{mode_indicator} ↙️  Backward + Left "
+                elif steering_angle > 0:
+                    status = f"{mode_indicator} ↘️  Backward + Right"
+                else:
+                    status = f"{mode_indicator} ⬇️  Backward        "
+            else:
+                if steering_angle != 0:
+                    status = f"{mode_indicator} ⏹️  Stopped (turning)"
+                else:
+                    status = f"{mode_indicator} ⏹️  Stopped          "
+            
+            if status != last_status:
+                print(status, end='\r')
+                last_status = status
                 
     except KeyboardInterrupt:
         print("\n🔒 Manual drive interrupted")
