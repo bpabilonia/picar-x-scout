@@ -15,7 +15,11 @@ Usage:
 """
 
 from openai_helper import OpenAiHelper
-from keys import OPENAI_API_KEY, OPENAI_ASSISTANT_ID
+from keys import (
+    OPENAI_API_KEY, OPENAI_ASSISTANT_ID,
+    SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
+    EMAIL_FROM, EMAIL_TO
+)
 from preset_actions import actions_dict, sounds_dict
 from utils import (
     gray_print, warn, error,
@@ -58,19 +62,12 @@ if '--keyboard' in args:
     input_mode = 'keyboard'
 
 # ============================================================================
-# EMAIL CONFIGURATION - UPDATE THESE VALUES
+# EMAIL CONFIGURATION
 # ============================================================================
+# Email credentials are imported from keys.py (SMTP_SERVER, SMTP_PORT, 
+# SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO)
+
 EMAIL_ENABLED = True  # Set to False to disable email alerts
-
-# SMTP Settings (Gmail example - use App Password, not regular password)
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USERNAME = "your_email@gmail.com"  # Your email address
-SMTP_PASSWORD = "your_app_password"      # Gmail App Password (not regular password)
-
-# Email recipients
-EMAIL_FROM = "your_email@gmail.com"
-EMAIL_TO = ["security_alert@example.com"]  # List of recipients
 
 # Email cooldown to prevent spam (seconds between emails for same detection type)
 EMAIL_COOLDOWN = 60  # Don't send another email for same type within 60 seconds
