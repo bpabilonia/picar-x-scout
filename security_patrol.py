@@ -31,7 +31,7 @@ import speech_recognition as sr
 from openai import OpenAI
 
 from picarx import Picarx
-from robot_hat import Music, Pin
+from robot_hat import Music, Pin, ADC
 
 import time
 import threading
@@ -149,6 +149,9 @@ class EmailAlert:
             gray_print(f"Email cooldown active for {detection_type} - skipping")
             return False
         
+        # Record attempt time BEFORE trying to send to prevent spam on repeated failures
+        self.last_email_times[detection_type] = time.time()
+        
         try:
             # Create message
             msg = MIMEMultipart()
@@ -194,7 +197,6 @@ This is an automated alert from your security patrol robot.
                 server.login(SMTP_USERNAME, SMTP_PASSWORD)
                 server.send_message(msg)
             
-            self.last_email_times[detection_type] = time.time()
             print(f"📧 Security alert email sent successfully!")
             return True
             
@@ -332,6 +334,36 @@ except Exception as e:
 
 music = Music()
 led = Pin('LED')
+
+# Battery monitoring (ADC pin A4 for battery voltage)
+battery_adc = ADC("A4")
+
+def get_battery_info():
+    """
+    Read battery voltage and estimate percentage.
+    PiCar-X uses 2S Li-ion battery (7.4V nominal, 8.4V full, 6.4V empty).
+    The ADC reads through a voltage divider (3:1 ratio).
+    """
+    try:
+        # Read ADC value (0-4095 for 12-bit ADC, maps to 0-3.3V)
+        adc_value = battery_adc.read()
+        # Convert to actual voltage (3.3V reference, 3:1 voltage divider)
+        voltage = (adc_value / 4095.0) * 3.3 * 3
+        
+        # Estimate percentage based on 2S Li-ion discharge curve
+        # Full: 8.4V (100%), Nominal: 7.4V (50%), Empty: 6.4V (0%)
+        if voltage >= 8.4:
+            percentage = 100
+        elif voltage <= 6.4:
+            percentage = 0
+        else:
+            # Linear approximation between 6.4V and 8.4V
+            percentage = int((voltage - 6.4) / (8.4 - 6.4) * 100)
+        
+        return voltage, percentage
+    except Exception as e:
+        print(f"Battery read error: {e}")
+        return None, None
 
 # Camera initialization
 from vilib import Vilib
@@ -610,54 +642,62 @@ def security_detection_loop():
                 
                 if intruders:
                     # INTRUDER DETECTED! Acquire car lock to prevent race with patrol loop
-                    with state.car_lock:
-                        state.handling_detection = True
-                        try:
+                    state.handling_detection = True
+                    speech_text = None
+                    
+                    try:
+                        # Phase 1: Car control operations (with lock)
+                        with state.car_lock:
                             my_car.stop()  # Stop to capture clear image
                             led.on()  # Alert light
-                            
-                            # Update detection stats
-                            state.increment_detections()
-                            
-                            # Get intruder names for logging
-                            intruder_names = [i['name'] for i in intruders]
-                            threat_levels = [i.get('threat_level', 'unknown') for i in intruders]
-                            
-                            print(f"\n🚨 SECURITY ALERT: {detection_type.upper()} DETECTED!")
-                            print(f"   Subjects: {', '.join(intruder_names)}")
-                            print(f"   Threat levels: {', '.join(threat_levels)}")
-                            print(f"   Summary: {summary}")
-                            
-                            # Capture high-quality image for email
-                            alert_img_path = f'./security_alerts/alert_{time.strftime("%Y%m%d_%H%M%S")}.jpg'
-                            os.makedirs('./security_alerts', exist_ok=True)
-                            cv2.imwrite(alert_img_path, Vilib.img)
-                            
-                            # Send email alert
-                            email_alert.send_alert(
-                                alert_img_path,
-                                detection_type,
-                                summary,
-                                intruder_names
-                            )
-                            
-                            # Announce detection
-                            if summary:
-                                speak(f"Security alert! {summary}")
-                            
-                            led.off()
-                            
-                            # Brief pause then continue patrol
-                            time.sleep(1.0)
-                            
-                            # Check path clearance before resuming
+                        
+                        # Update detection stats
+                        state.increment_detections()
+                        
+                        # Get intruder names for logging
+                        intruder_names = [i['name'] for i in intruders]
+                        threat_levels = [i.get('threat_level', 'unknown') for i in intruders]
+                        
+                        print(f"\n🚨 SECURITY ALERT: {detection_type.upper()} DETECTED!")
+                        print(f"   Subjects: {', '.join(intruder_names)}")
+                        print(f"   Threat levels: {', '.join(threat_levels)}")
+                        print(f"   Summary: {summary}")
+                        
+                        # Capture high-quality image for email
+                        alert_img_path = f'./security_alerts/alert_{time.strftime("%Y%m%d_%H%M%S")}.jpg'
+                        os.makedirs('./security_alerts', exist_ok=True)
+                        cv2.imwrite(alert_img_path, Vilib.img)
+                        
+                        # Send email alert
+                        email_alert.send_alert(
+                            alert_img_path,
+                            detection_type,
+                            summary,
+                            intruder_names
+                        )
+                        
+                        # Prepare speech text (will be spoken outside lock)
+                        if summary:
+                            speech_text = f"Security alert! {summary}"
+                        
+                        led.off()
+                        
+                        # Phase 2: Announce detection (without lock - allows patrol to check state)
+                        if speech_text:
+                            speak(speech_text)
+                        
+                        # Brief pause then continue patrol
+                        time.sleep(1.0)
+                        
+                        # Phase 3: Check path clearance (with lock for car control)
+                        with state.car_lock:
                             distance = my_car.get_distance()
                             if distance >= 0 and distance < SAFE_CLEARANCE:
                                 backup_and_navigate()
                                 state.stuck_counter = 0
                                 state.last_distance = -1
-                        finally:
-                            state.handling_detection = False
+                    finally:
+                        state.handling_detection = False
                     
         except Exception as e:
             print(f"Detection loop error: {e}")
@@ -1058,6 +1098,116 @@ def voice_command_loop():
         time.sleep(0.1)
 
 # ============================================================================
+# Manual Drive Mode (Joystick with Arrow Keys)
+# ============================================================================
+MANUAL_DRIVE_SPEED = 30  # Speed for manual control
+
+def get_key():
+    """Get a single keypress (including arrow keys) without waiting for Enter."""
+    import sys
+    import tty
+    import termios
+    
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+        # Check for escape sequence (arrow keys)
+        if ch == '\x1b':
+            ch2 = sys.stdin.read(1)
+            if ch2 == '[':
+                ch3 = sys.stdin.read(1)
+                return '\x1b[' + ch3  # Return full escape sequence
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def manual_drive_mode():
+    """Enter manual drive mode with arrow key controls."""
+    print("\n🎮 MANUAL DRIVE MODE")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  ↑  Forward")
+    print("  ↓  Backward")
+    print("  ←  Turn Left")
+    print("  →  Turn Right")
+    print("  SPACE  Stop")
+    print("  Q  Exit manual mode")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("Press any arrow key to start driving...\n")
+    
+    # Stop any automatic patrol
+    was_patrolling = state.patrolling
+    state.patrolling = False
+    my_car.stop()
+    my_car.set_dir_servo_angle(0)
+    
+    current_direction = None
+    
+    try:
+        while True:
+            key = get_key()
+            
+            if key == 'q' or key == 'Q':
+                print("\n🔒 Exiting manual drive mode")
+                my_car.stop()
+                my_car.set_dir_servo_angle(0)
+                break
+            
+            elif key == '\x1b[A':  # Up arrow - Forward
+                if current_direction != 'forward':
+                    my_car.set_dir_servo_angle(0)
+                    my_car.forward(MANUAL_DRIVE_SPEED)
+                    current_direction = 'forward'
+                    print("⬆️  Forward ", end='\r')
+            
+            elif key == '\x1b[B':  # Down arrow - Backward
+                if current_direction != 'backward':
+                    my_car.set_dir_servo_angle(0)
+                    my_car.backward(MANUAL_DRIVE_SPEED)
+                    current_direction = 'backward'
+                    print("⬇️  Backward", end='\r')
+            
+            elif key == '\x1b[D':  # Left arrow - Turn Left
+                my_car.set_dir_servo_angle(30)
+                if current_direction == 'forward':
+                    my_car.forward(MANUAL_DRIVE_SPEED)
+                elif current_direction == 'backward':
+                    my_car.backward(MANUAL_DRIVE_SPEED)
+                else:
+                    my_car.forward(MANUAL_DRIVE_SPEED)
+                    current_direction = 'forward'
+                print("⬅️  Left    ", end='\r')
+            
+            elif key == '\x1b[C':  # Right arrow - Turn Right
+                my_car.set_dir_servo_angle(-30)
+                if current_direction == 'forward':
+                    my_car.forward(MANUAL_DRIVE_SPEED)
+                elif current_direction == 'backward':
+                    my_car.backward(MANUAL_DRIVE_SPEED)
+                else:
+                    my_car.forward(MANUAL_DRIVE_SPEED)
+                    current_direction = 'forward'
+                print("➡️  Right   ", end='\r')
+            
+            elif key == ' ':  # Space - Stop
+                my_car.stop()
+                my_car.set_dir_servo_angle(0)
+                current_direction = None
+                print("⏹️  Stopped ", end='\r')
+            
+            elif key == '\x03':  # Ctrl+C
+                raise KeyboardInterrupt
+                
+    except KeyboardInterrupt:
+        print("\n🔒 Manual drive interrupted")
+    finally:
+        my_car.stop()
+        my_car.set_dir_servo_angle(0)
+        if was_patrolling:
+            print("ℹ️  Type 'patrol' to resume automatic patrol")
+
+# ============================================================================
 # Keyboard Input Loop
 # ============================================================================
 def keyboard_loop():
@@ -1067,6 +1217,7 @@ def keyboard_loop():
     print("\nSecurity Patrol Commands:")
     print("  'stop'   - Halt patrol")
     print("  'patrol' - Start/resume patrol")
+    print("  'drive'  - Manual drive mode (arrow keys)")
     print("  'scan'   - Force security scan")
     print("  'status' - Show patrol status")
     print("  'test'   - Test email (requires valid config)")
@@ -1102,6 +1253,9 @@ def keyboard_loop():
                 else:
                     print("ℹ️ Already patrolling")
                     speak("Security patrol already active.")
+            
+            elif user_input.lower() == 'drive':
+                manual_drive_mode()
                 
             elif user_input.lower() == 'scan':
                 img_path = './manual_security_scan.jpg'
@@ -1127,6 +1281,13 @@ def keyboard_loop():
                 print(f"   Time since last detection: {time_since:.0f}s")
                 print(f"   Idle timeout: {IDLE_TIMEOUT_SECONDS}s")
                 print(f"   Email enabled: {EMAIL_ENABLED}")
+                # Battery status
+                voltage, percentage = get_battery_info()
+                if voltage is not None:
+                    battery_icon = "🔋" if percentage > 20 else "🪫"
+                    print(f"   {battery_icon} Battery: {percentage}% ({voltage:.2f}V)")
+                else:
+                    print(f"   🔋 Battery: Unable to read")
                 print()
                 
             elif user_input.lower() == 'test':
