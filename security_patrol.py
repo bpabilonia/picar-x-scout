@@ -879,62 +879,71 @@ def initial_clearance_check():
     """Check path clearance before starting patrol."""
     print("🔍 Checking patrol route clearance...")
     
-    left_dist, center_dist, right_dist = scan_for_clearance()
-    print(f"   Left: {left_dist:.0f}cm | Center: {center_dist:.0f}cm | Right: {right_dist:.0f}cm")
+    # Prevent other loops from interfering during clearance check
+    state.handling_detection = True
     
-    if center_dist >= SAFE_CLEARANCE:
-        print("✅ Forward path is clear!")
-        return True
-    
-    print(f"⚠️ Forward path blocked ({center_dist:.0f}cm) - finding clear route...")
-    
-    if left_dist >= SAFE_CLEARANCE or right_dist >= SAFE_CLEARANCE:
-        if left_dist > right_dist:
-            turn_angle = 35
-            direction = "LEFT"
-        else:
-            turn_angle = -35
-            direction = "RIGHT"
+    try:
+        left_dist, center_dist, right_dist = scan_for_clearance()
+        print(f"   Left: {left_dist:.0f}cm | Center: {center_dist:.0f}cm | Right: {right_dist:.0f}cm")
         
-        print(f"🔄 Turning {direction}")
+        if center_dist >= SAFE_CLEARANCE:
+            print("✅ Forward path is clear!")
+            return True
         
-        my_car.set_dir_servo_angle(turn_angle)
-        my_car.forward(PATROL_SPEED)
-        time.sleep(1.5)
-        my_car.set_dir_servo_angle(0)
-        my_car.stop()
+        print(f"⚠️ Forward path blocked ({center_dist:.0f}cm) - finding clear route...")
+        
+        if left_dist >= SAFE_CLEARANCE or right_dist >= SAFE_CLEARANCE:
+            if left_dist > right_dist:
+                turn_angle = 35
+                direction = "LEFT"
+            else:
+                turn_angle = -35
+                direction = "RIGHT"
+            
+            print(f"🔄 Turning {direction}")
+            
+            with state.car_lock:
+                my_car.set_dir_servo_angle(turn_angle)
+                my_car.forward(PATROL_SPEED)
+                time.sleep(1.5)
+                my_car.set_dir_servo_angle(0)
+                my_car.stop()
+            time.sleep(0.2)
+            
+            return True
+        
+        print("🚧 All directions blocked - backing up...")
+        with state.car_lock:
+            my_car.backward(BACKUP_SPEED)
+            time.sleep(1.0)
+            my_car.stop()
         time.sleep(0.2)
         
-        return True
-    
-    print("🚧 All directions blocked - backing up...")
-    my_car.backward(BACKUP_SPEED)
-    time.sleep(1.0)
-    my_car.stop()
-    time.sleep(0.2)
-    
-    left_dist, center_dist, right_dist = scan_for_clearance()
-    max_dist = max(left_dist, center_dist, right_dist)
-    
-    if max_dist >= SAFE_CLEARANCE:
-        if max_dist == center_dist:
-            turn_angle = 0
-        elif max_dist == left_dist:
-            turn_angle = 35
-        else:
-            turn_angle = -35
+        left_dist, center_dist, right_dist = scan_for_clearance()
+        max_dist = max(left_dist, center_dist, right_dist)
         
-        if turn_angle != 0:
-            my_car.set_dir_servo_angle(turn_angle)
-            my_car.forward(PATROL_SPEED)
-            time.sleep(1.5)
-            my_car.set_dir_servo_angle(0)
-            my_car.stop()
+        if max_dist >= SAFE_CLEARANCE:
+            if max_dist == center_dist:
+                turn_angle = 0
+            elif max_dist == left_dist:
+                turn_angle = 35
+            else:
+                turn_angle = -35
+            
+            if turn_angle != 0:
+                with state.car_lock:
+                    my_car.set_dir_servo_angle(turn_angle)
+                    my_car.forward(PATROL_SPEED)
+                    time.sleep(1.5)
+                    my_car.set_dir_servo_angle(0)
+                    my_car.stop()
+            
+            return True
         
-        return True
-    
-    print("❌ Could not find clear path")
-    return False
+        print("❌ Could not find clear path")
+        return False
+    finally:
+        state.handling_detection = False
 
 def find_safe_path():
     """Scan surroundings and find the safest path."""
@@ -1082,7 +1091,8 @@ def voice_command_loop():
             if wake_action == 'stop':
                 state.patrolling = False
                 state.paused_due_to_timeout = False
-                my_car.stop()
+                with state.car_lock:
+                    my_car.stop()
                 print("\n🛑 PATROL HALTED")
                 speak("Security patrol halted. Standing by.")
                 
@@ -1158,11 +1168,14 @@ def manual_drive_mode():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("Press arrow keys to drive. Car keeps moving until SPACE.\n")
     
-    # Stop any automatic patrol
+    # Stop any automatic patrol and prevent other loops from interfering
     was_patrolling = state.patrolling
     state.patrolling = False
-    my_car.stop()
-    my_car.set_dir_servo_angle(0)
+    state.handling_detection = True  # Blocks detection/patrol loops from issuing car commands
+    
+    with state.car_lock:
+        my_car.stop()
+        my_car.set_dir_servo_angle(0)
     
     # Drive state
     drive_direction = None  # None, 'forward', 'backward'
@@ -1183,14 +1196,18 @@ def manual_drive_mode():
                 
                 elif key == '\x1b[A':  # Up arrow - Forward
                     drive_direction = 'forward'
+                    steering_angle = 0  # Go straight
                 
                 elif key == '\x1b[B':  # Down arrow - Backward
                     drive_direction = 'backward'
+                    steering_angle = 0  # Go straight
                 
-                elif key == '\x1b[D':  # Left arrow - Turn Left
+                elif key == '\x1b[D':  # Left arrow - Turn Left (drive forward while turning)
+                    drive_direction = 'forward'
                     steering_angle = -30
                 
-                elif key == '\x1b[C':  # Right arrow - Turn Right
+                elif key == '\x1b[C':  # Right arrow - Turn Right (drive forward while turning)
+                    drive_direction = 'forward'
                     steering_angle = 30
                 
                 elif key == ' ':  # Space - Stop
@@ -1238,8 +1255,10 @@ def manual_drive_mode():
     except KeyboardInterrupt:
         print("\n🔒 Manual drive interrupted")
     finally:
-        my_car.stop()
-        my_car.set_dir_servo_angle(0)
+        with state.car_lock:
+            my_car.stop()
+            my_car.set_dir_servo_angle(0)
+        state.handling_detection = False  # Allow other loops to resume
         if was_patrolling:
             print("ℹ️  Type 'patrol' to resume automatic patrol")
 
@@ -1269,7 +1288,8 @@ def keyboard_loop():
             if user_input.lower() == 'stop':
                 state.patrolling = False
                 state.paused_due_to_timeout = False
-                my_car.stop()
+                with state.car_lock:
+                    my_car.stop()
                 print("🛑 Patrol halted")
                 speak("Security patrol halted.")
                 
