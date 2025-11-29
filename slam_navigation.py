@@ -83,13 +83,17 @@ except ImportError:
 ROS_AVAILABLE = False
 try:
     import rospy
-    from nav_msgs.msg import OccupancyGrid, Odometry, Path
+    from nav_msgs.msg import OccupancyGrid as ROSOccupancyGrid, Odometry, Path
     from sensor_msgs.msg import LaserScan
     from geometry_msgs.msg import PoseStamped, Twist
     from tf.transformations import euler_from_quaternion
     ROS_AVAILABLE = True
 except ImportError:
-    pass
+    # Define placeholder types for type hints when ROS not available
+    ROSOccupancyGrid = None
+    Odometry = None
+    LaserScan = None
+    Twist = None
 
 # RPLIDAR SDK (optional)
 RPLIDAR_AVAILABLE = False
@@ -894,111 +898,117 @@ class DynamicWindowApproach:
     def _heading_cost(self, pose: Pose2D, goal: Pose2D) -> float:
         """Calculate heading alignment with goal."""
         angle_to_goal = math.atan2(goal.y - pose.y, goal.x - pose.x)
-        angle_diff = abs(pose.theta - angle_to_goal)
+        angle_diff = pose.theta - angle_to_goal
         
+        # Normalize to [-pi, pi] first, then take absolute value
         while angle_diff > math.pi:
             angle_diff -= 2 * math.pi
-        angle_diff = abs(angle_diff)
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
         
-        return math.pi - angle_diff
+        return math.pi - abs(angle_diff)
 
 
 # ============================================================================
 # ROS SLAM Interface (GMapping / Hector SLAM)
 # ============================================================================
-class ROSSlamInterface:
-    """
-    Interface to ROS-based SLAM systems.
-    
-    Supports:
-    - GMapping (grid-based SLAM)
-    - Hector SLAM (high-frequency LIDAR)
-    """
-    
-    def __init__(self, slam_type: str = 'gmapping'):
-        if not ROS_AVAILABLE:
-            raise RuntimeError("ROS is not available. Install ROS and rospy.")
+if ROS_AVAILABLE:
+    class ROSSlamInterface:
+        """
+        Interface to ROS-based SLAM systems.
         
-        self.slam_type = slam_type
+        Supports:
+        - GMapping (grid-based SLAM)
+        - Hector SLAM (high-frequency LIDAR)
+        """
         
-        # Initialize ROS node
-        rospy.init_node('picar_slam', anonymous=True)
-        
-        # Subscribers
-        self.map_sub = rospy.Subscriber('/map', OccupancyGrid, self._map_callback)
-        self.odom_sub = rospy.Subscriber('/odom', Odometry, self._odom_callback)
-        
-        # Publishers
-        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        self.scan_pub = rospy.Publisher('/scan', LaserScan, queue_size=10)
-        
-        # Data
-        self.current_map = None
-        self.current_pose = Pose2D()
-        self.lock = threading.Lock()
-        
-        print(f"ROS SLAM interface initialized ({slam_type})")
-    
-    def _map_callback(self, msg: OccupancyGrid):
-        """Handle incoming map data."""
-        with self.lock:
-            self.current_map = msg
-    
-    def _odom_callback(self, msg: Odometry):
-        """Handle incoming odometry data."""
-        with self.lock:
-            self.current_pose.x = msg.pose.pose.position.x
-            self.current_pose.y = msg.pose.pose.position.y
+        def __init__(self, slam_type: str = 'gmapping'):
+            self.slam_type = slam_type
             
-            # Extract yaw from quaternion
-            orientation = msg.pose.pose.orientation
-            _, _, yaw = euler_from_quaternion([
-                orientation.x, orientation.y, orientation.z, orientation.w
-            ])
-            self.current_pose.theta = yaw
-    
-    def publish_scan(self, scan: ScanData):
-        """Publish scan data to ROS."""
-        msg = LaserScan()
-        msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = 'laser_frame'
-        
-        msg.angle_min = -math.pi
-        msg.angle_max = math.pi
-        msg.angle_increment = 2 * math.pi / len(scan.readings)
-        msg.range_min = LIDAR_MIN_RANGE
-        msg.range_max = LIDAR_MAX_RANGE
-        
-        msg.ranges = [r.distance for r in scan.readings]
-        msg.intensities = [r.intensity for r in scan.readings]
-        
-        self.scan_pub.publish(msg)
-    
-    def send_velocity(self, linear: float, angular: float):
-        """Send velocity command via ROS."""
-        msg = Twist()
-        msg.linear.x = linear
-        msg.angular.z = angular
-        self.cmd_pub.publish(msg)
-    
-    def get_pose(self) -> Pose2D:
-        """Get current pose from ROS."""
-        with self.lock:
-            return Pose2D(x=self.current_pose.x, y=self.current_pose.y, 
-                         theta=self.current_pose.theta)
-    
-    def get_map(self) -> Optional[np.ndarray]:
-        """Get current occupancy grid from ROS."""
-        with self.lock:
-            if self.current_map is None:
-                return None
+            # Initialize ROS node
+            rospy.init_node('picar_slam', anonymous=True)
             
-            # Convert to numpy array
-            width = self.current_map.info.width
-            height = self.current_map.info.height
-            data = np.array(self.current_map.data).reshape((height, width))
+            # Subscribers
+            self.map_sub = rospy.Subscriber('/map', ROSOccupancyGrid, self._map_callback)
+            self.odom_sub = rospy.Subscriber('/odom', Odometry, self._odom_callback)
             
-            return data
+            # Publishers
+            self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+            self.scan_pub = rospy.Publisher('/scan', LaserScan, queue_size=10)
+            
+            # Data
+            self.current_map = None
+            self.current_pose = Pose2D()
+            self.lock = threading.Lock()
+            
+            print(f"ROS SLAM interface initialized ({slam_type})")
+        
+        def _map_callback(self, msg):
+            """Handle incoming map data."""
+            with self.lock:
+                self.current_map = msg
+        
+        def _odom_callback(self, msg):
+            """Handle incoming odometry data."""
+            with self.lock:
+                self.current_pose.x = msg.pose.pose.position.x
+                self.current_pose.y = msg.pose.pose.position.y
+                
+                # Extract yaw from quaternion
+                orientation = msg.pose.pose.orientation
+                _, _, yaw = euler_from_quaternion([
+                    orientation.x, orientation.y, orientation.z, orientation.w
+                ])
+                self.current_pose.theta = yaw
+        
+        def publish_scan(self, scan: ScanData):
+            """Publish scan data to ROS."""
+            msg = LaserScan()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = 'laser_frame'
+            
+            msg.angle_min = -math.pi
+            msg.angle_max = math.pi
+            msg.angle_increment = 2 * math.pi / len(scan.readings)
+            msg.range_min = LIDAR_MIN_RANGE
+            msg.range_max = LIDAR_MAX_RANGE
+            
+            msg.ranges = [r.distance for r in scan.readings]
+            msg.intensities = [r.intensity for r in scan.readings]
+            
+            self.scan_pub.publish(msg)
+        
+        def send_velocity(self, linear: float, angular: float):
+            """Send velocity command via ROS."""
+            msg = Twist()
+            msg.linear.x = linear
+            msg.angular.z = angular
+            self.cmd_pub.publish(msg)
+        
+        def get_pose(self) -> Pose2D:
+            """Get current pose from ROS."""
+            with self.lock:
+                return Pose2D(x=self.current_pose.x, y=self.current_pose.y, 
+                             theta=self.current_pose.theta)
+        
+        def get_map(self) -> Optional[np.ndarray]:
+            """Get current occupancy grid from ROS."""
+            with self.lock:
+                if self.current_map is None:
+                    return None
+                
+                # Convert to numpy array
+                width = self.current_map.info.width
+                height = self.current_map.info.height
+                data = np.array(self.current_map.data).reshape((height, width))
+                
+                return data
+else:
+    # Placeholder class when ROS is not available
+    class ROSSlamInterface:
+        """Placeholder for ROS SLAM interface when ROS is not installed."""
+        def __init__(self, slam_type: str = 'gmapping'):
+            raise RuntimeError("ROS is not available. Install ROS and rospy to use ROS-based SLAM.")
 
 
 # ============================================================================
@@ -1499,11 +1509,8 @@ class SLAMNavigationController:
                         scan.pose = self.current_pose
                         self.occupancy_map.update_with_scan(self.current_pose, scan)
                 
-                # Get current pose
-                if self.use_ros:
-                    self.current_pose = self.slam.get_pose()
-                else:
-                    self.current_pose = self.slam.get_pose()
+                # Get current pose from SLAM (works for both ROS and EKF modes)
+                self.current_pose = self.slam.get_pose()
                 
                 # Execute mode-specific behavior
                 if self.mode == NavigationMode.MAPPING:
@@ -1638,12 +1645,17 @@ class SLAMNavigationController:
             for x in range(1, self.occupancy_map.width - 1):
                 if occupancy[y, x] < 0:  # Unknown
                     # Check if adjacent to free space
+                    is_frontier = False
                     for dy in [-1, 0, 1]:
                         for dx in [-1, 0, 1]:
                             if occupancy[y + dy, x + dx] < 30 and occupancy[y + dy, x + dx] >= 0:
-                                wx, wy = self.occupancy_map.grid_to_world(x, y)
-                                frontiers.append((wx, wy))
+                                is_frontier = True
                                 break
+                        if is_frontier:
+                            break
+                    if is_frontier:
+                        wx, wy = self.occupancy_map.grid_to_world(x, y)
+                        frontiers.append((wx, wy))
         
         if not frontiers:
             return None
