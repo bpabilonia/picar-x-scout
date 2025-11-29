@@ -1523,13 +1523,60 @@ class SLAMNavigationController:
         self.set_mode(NavigationMode.PATROL)
         print(f"Starting patrol with {len(waypoints)} waypoints")
     
+    def _initial_obstacle_check(self):
+        """Check for obstacles before starting autonomous movement."""
+        if not self.car:
+            return True  # No car, assume OK
+        
+        print("Checking for obstacles...")
+        self.car.stop()
+        time.sleep(0.2)
+        
+        # Get distance reading
+        dist_cm = self.car.get_distance()
+        
+        if dist_cm > 0 and dist_cm < 30:  # Less than 30cm
+            print(f"⚠️  Obstacle detected at {dist_cm}cm - backing up first")
+            # Back up
+            self.car.set_dir_servo_angle(0)
+            self.car.backward(30)
+            time.sleep(1.0)
+            self.car.stop()
+            time.sleep(0.1)
+            # Turn
+            import random
+            turn_dir = random.choice([-1, 1])
+            self.car.set_dir_servo_angle(35 * turn_dir)
+            self.car.forward(30)
+            time.sleep(1.2)
+            self.car.set_dir_servo_angle(0)
+            self.car.stop()
+            time.sleep(0.1)
+            # Check again
+            dist_cm = self.car.get_distance()
+            if dist_cm > 0 and dist_cm < 30:
+                print(f"⚠️  Still blocked at {dist_cm}cm - please reposition robot")
+                return False
+        
+        if dist_cm > 0:
+            print(f"✓ Path clear ({dist_cm}cm)")
+        else:
+            print("✓ No obstacle detected")
+        return True
+    
     def start_mapping(self):
         """Start mapping mode."""
+        if not self._initial_obstacle_check():
+            print("Cannot start mapping - path blocked")
+            return
         self.set_mode(NavigationMode.MAPPING)
-        print("Mapping mode started - drive the robot to explore")
+        print("Mapping mode started")
     
     def start_exploration(self):
         """Start autonomous exploration."""
+        if not self._initial_obstacle_check():
+            print("Cannot start exploration - path blocked")
+            return
         self.set_mode(NavigationMode.EXPLORE)
         print("Exploration mode started")
     
@@ -1767,6 +1814,16 @@ class SLAMNavigationController:
                 obstacle_distance = dist_cm / 100.0  # Convert to meters
         
         # Obstacle avoidance behavior
+        if obstacle_distance is None:
+            # No valid sensor reading - stop and try to get a reading
+            if self.car:
+                self.car.stop()
+                time.sleep(0.1)
+                # Try to get a fresh reading
+                dist_cm = self.car.get_distance()
+                if dist_cm > 0:
+                    obstacle_distance = dist_cm / 100.0
+        
         if obstacle_distance is not None and obstacle_distance < 0.25:  # 25cm - too close!
             # Too close - back up first, then turn
             gray_print(f"Obstacle at {obstacle_distance:.2f}m - backing up!")
@@ -1787,6 +1844,15 @@ class SLAMNavigationController:
                 self.car.set_dir_servo_angle(0)
                 self.car.stop()
                 time.sleep(0.2)
+                # Check again after maneuver
+                dist_cm = self.car.get_distance()
+                if dist_cm > 0 and dist_cm < 30:  # Still too close
+                    gray_print(f"Still close ({dist_cm}cm) - turning more")
+                    self.car.set_dir_servo_angle(35 * turn_direction)
+                    self.car.forward(30)
+                    time.sleep(1.0)
+                    self.car.set_dir_servo_angle(0)
+                    self.car.stop()
         elif obstacle_distance is not None and obstacle_distance < 0.5:  # 50cm threshold
             # Obstacle ahead - stop and turn
             gray_print(f"Obstacle at {obstacle_distance:.2f}m - turning")
@@ -1799,11 +1865,24 @@ class SLAMNavigationController:
                 self.car.set_dir_servo_angle(0)
                 self.car.stop()
                 time.sleep(0.1)
-        else:
-            # Path clear - drive forward
+                # Check again after turning
+                dist_cm = self.car.get_distance()
+                if dist_cm > 0 and dist_cm < 50:  # Still has obstacle
+                    gray_print(f"Still blocked ({dist_cm}cm) - turning more")
+                    self.car.set_dir_servo_angle(35 * turn_direction)
+                    self.car.forward(25)
+                    time.sleep(1.0)
+                    self.car.set_dir_servo_angle(0)
+                    self.car.stop()
+        elif obstacle_distance is not None and obstacle_distance >= 0.5:
+            # Path confirmed clear - drive forward
             if self.car:
                 self.car.set_dir_servo_angle(0)
                 self.car.forward(25)
+        else:
+            # No valid reading even after retry - stay stopped for safety
+            if self.car:
+                self.car.stop()
     
     def _compute_velocity_to_waypoint(self, waypoint: Pose2D, 
                                       scan: Optional[ScanData]) -> Tuple[float, float]:
