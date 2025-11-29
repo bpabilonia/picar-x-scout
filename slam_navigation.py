@@ -1767,47 +1767,43 @@ class SLAMNavigationController:
                 obstacle_distance = dist_cm / 100.0  # Convert to meters
         
         # Obstacle avoidance behavior
-        if obstacle_distance is not None and obstacle_distance < 0.15:  # 15cm - very close!
+        if obstacle_distance is not None and obstacle_distance < 0.25:  # 25cm - too close!
             # Too close - back up first, then turn
             gray_print(f"Obstacle at {obstacle_distance:.2f}m - backing up!")
             if self.car:
                 self.car.stop()
                 time.sleep(0.1)
-                # Back up
+                # Back up longer distance
                 self.car.set_dir_servo_angle(0)
-                self.car.backward(25)
-                time.sleep(0.8)
+                self.car.backward(30)
+                time.sleep(1.2)  # Longer backup
                 self.car.stop()
                 time.sleep(0.1)
-                # Turn away
+                # Turn away - longer turn
                 turn_direction = random.choice([-1, 1])
                 self.car.set_dir_servo_angle(35 * turn_direction)
-                self.car.forward(25)
-                time.sleep(1.0)
+                self.car.forward(30)
+                time.sleep(1.5)  # Longer turn
                 self.car.set_dir_servo_angle(0)
                 self.car.stop()
-        elif obstacle_distance is not None and obstacle_distance < 0.4:  # 40cm threshold
-            # Obstacle close - stop and turn
+                time.sleep(0.2)
+        elif obstacle_distance is not None and obstacle_distance < 0.5:  # 50cm threshold
+            # Obstacle ahead - stop and turn
             gray_print(f"Obstacle at {obstacle_distance:.2f}m - turning")
             if self.car:
                 self.car.stop()
                 turn_direction = random.choice([-1, 1])
-                self.car.set_dir_servo_angle(30 * turn_direction)
-                self.car.forward(20)
-                time.sleep(0.8)
+                self.car.set_dir_servo_angle(35 * turn_direction)
+                self.car.forward(25)
+                time.sleep(1.2)
                 self.car.set_dir_servo_angle(0)
                 self.car.stop()
-        elif obstacle_distance is not None and obstacle_distance < 0.6:
-            # Obstacle medium distance - slow down and slight turn
-            turn_direction = random.choice([-1, 1])
-            self._send_velocity(0.15, turn_direction * 0.3)
+                time.sleep(0.1)
         else:
-            # Path clear - drive forward with occasional random turns
-            if random.random() < 0.1:  # 10% chance to make a slight turn
-                omega = random.uniform(-0.3, 0.3)
-            else:
-                omega = 0
-            self._send_velocity(0.25, omega)  # Drive forward at 0.25 m/s
+            # Path clear - drive forward
+            if self.car:
+                self.car.set_dir_servo_angle(0)
+                self.car.forward(25)
     
     def _compute_velocity_to_waypoint(self, waypoint: Pose2D, 
                                       scan: Optional[ScanData]) -> Tuple[float, float]:
@@ -1900,39 +1896,12 @@ class SLAMNavigationController:
 # ============================================================================
 MANUAL_DRIVE_SPEED = 30
 
-def get_key_nonblocking():
-    """Get a keypress without blocking. Returns None if no key pressed."""
+def manual_drive_mode(controller: SLAMNavigationController):
+    """Enter manual drive mode with arrow key controls."""
     import tty
     import termios
     import select
     
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if rlist:
-            ch = sys.stdin.read(1)
-            if ch == '\x1b':
-                rlist2, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if rlist2:
-                    ch2 = sys.stdin.read(1)
-                    if ch2 == '[':
-                        rlist3, _, _ = select.select([sys.stdin], [], [], 0.1)
-                        if rlist3:
-                            ch3 = sys.stdin.read(1)
-                            return '\x1b[' + ch3
-                        return '\x1b['
-                    return '\x1b' + ch2
-                return ch
-            return ch
-        return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
-def manual_drive_mode(controller: SLAMNavigationController):
-    """Enter manual drive mode with arrow key controls."""
     if not controller.car:
         print("No car available for manual drive")
         return
@@ -1940,89 +1909,104 @@ def manual_drive_mode(controller: SLAMNavigationController):
     print("\n" + "="*40)
     print("🎮 MANUAL DRIVE MODE")
     print("="*40)
-    print("  ↑  Forward")
-    print("  ↓  Backward")
-    print("  ←  Turn Left")
-    print("  →  Turn Right")
-    print("  SPACE  Stop")
-    print("  Q  Exit drive mode")
+    print("  w / ↑    Forward")
+    print("  s / ↓    Backward")
+    print("  a / ←    Turn Left")
+    print("  d / →    Turn Right")
+    print("  SPACE    Stop")
+    print("  q        Exit drive mode")
     print("="*40)
-    print("Car keeps moving until SPACE or new direction.\n")
+    print("Press keys to drive.\n")
     
     # Stop any autonomous mode
-    prev_mode = controller.mode
     controller.set_mode(NavigationMode.IDLE)
     controller.car.stop()
     controller.car.set_dir_servo_angle(0)
     
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    
     drive_direction = None
     steering_angle = 0
-    last_status = ""
     
     try:
+        tty.setcbreak(fd)  # Use cbreak mode instead of raw for better compatibility
+        
         while True:
-            key = get_key_nonblocking()
+            # Check for input
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
             
-            if key:
+            if rlist:
+                key = sys.stdin.read(1)
+                
+                # Handle escape sequences (arrow keys)
+                if key == '\x1b':
+                    # Try to read more for arrow key sequence
+                    rlist2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if rlist2:
+                        key2 = sys.stdin.read(1)
+                        if key2 == '[':
+                            rlist3, _, _ = select.select([sys.stdin], [], [], 0.05)
+                            if rlist3:
+                                key3 = sys.stdin.read(1)
+                                if key3 == 'A':  # Up
+                                    key = 'w'
+                                elif key3 == 'B':  # Down
+                                    key = 's'
+                                elif key3 == 'C':  # Right
+                                    key = 'd'
+                                elif key3 == 'D':  # Left
+                                    key = 'a'
+                
+                # Process key
                 if key == 'q' or key == 'Q':
                     print("\n✓ Exiting drive mode")
-                    controller.car.stop()
-                    controller.car.set_dir_servo_angle(0)
                     break
                 
-                elif key == '\x1b[A':  # Up arrow
+                elif key == 'w' or key == 'W':
                     drive_direction = 'forward'
                     steering_angle = 0
+                    print("⬆️  Forward    ", end='\r', flush=True)
                 
-                elif key == '\x1b[B':  # Down arrow
+                elif key == 's' or key == 'S':
                     drive_direction = 'backward'
                     steering_angle = 0
+                    print("⬇️  Backward   ", end='\r', flush=True)
                 
-                elif key == '\x1b[D':  # Left arrow
+                elif key == 'a' or key == 'A':
                     drive_direction = 'forward'
                     steering_angle = 30
+                    print("↖️  Left+Fwd   ", end='\r', flush=True)
                 
-                elif key == '\x1b[C':  # Right arrow
+                elif key == 'd' or key == 'D':
                     drive_direction = 'forward'
                     steering_angle = -30
+                    print("↗️  Right+Fwd  ", end='\r', flush=True)
                 
-                elif key == ' ':  # Space
+                elif key == ' ':
                     drive_direction = None
                     steering_angle = 0
+                    print("⏹️  Stopped    ", end='\r', flush=True)
                 
                 elif key == '\x03':  # Ctrl+C
                     raise KeyboardInterrupt
             
-            # Apply drive state
+            # Apply drive state continuously
             controller.car.set_dir_servo_angle(steering_angle)
-            
             if drive_direction == 'forward':
                 controller.car.forward(MANUAL_DRIVE_SPEED)
             elif drive_direction == 'backward':
                 controller.car.backward(MANUAL_DRIVE_SPEED)
             else:
                 controller.car.stop()
-            
-            # Status display
-            if drive_direction == 'forward':
-                if steering_angle > 0:
-                    status = "↖️  Forward + Left "
-                elif steering_angle < 0:
-                    status = "↗️  Forward + Right"
-                else:
-                    status = "⬆️  Forward        "
-            elif drive_direction == 'backward':
-                status = "⬇️  Backward       "
-            else:
-                status = "⏹️  Stopped        "
-            
-            if status != last_status:
-                print(status, end='\r', flush=True)
-                last_status = status
                 
     except KeyboardInterrupt:
         print("\n✓ Drive interrupted")
+    except Exception as e:
+        print(f"\nDrive error: {e}")
     finally:
+        # Restore terminal and stop car
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         controller.car.stop()
         controller.car.set_dir_servo_angle(0)
         print("Ready for commands.\n")
