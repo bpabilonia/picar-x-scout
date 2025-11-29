@@ -1622,8 +1622,10 @@ class SLAMNavigationController:
                 pass
     
     def _mapping_step(self, scan: Optional[ScanData]):
-        """Mapping mode - just update map, no autonomous motion."""
-        pass  # Map update happens in control loop
+        """Mapping mode - autonomous exploration to build the map."""
+        # Use random exploration with obstacle avoidance to build the map
+        # The map gets updated automatically in the control loop when scan data arrives
+        self._random_exploration(scan)
     
     def _goto_step(self, scan: Optional[ScanData]):
         """Navigate to goal."""
@@ -1764,12 +1766,37 @@ class SLAMNavigationController:
             if dist_cm > 0:
                 obstacle_distance = dist_cm / 100.0  # Convert to meters
         
-        # Simple behavior: drive forward, turn if obstacle detected
-        if obstacle_distance is not None and obstacle_distance < 0.4:  # 40cm threshold
-            # Obstacle close - turn randomly
+        # Obstacle avoidance behavior
+        if obstacle_distance is not None and obstacle_distance < 0.15:  # 15cm - very close!
+            # Too close - back up first, then turn
+            gray_print(f"Obstacle at {obstacle_distance:.2f}m - backing up!")
+            if self.car:
+                self.car.stop()
+                time.sleep(0.1)
+                # Back up
+                self.car.set_dir_servo_angle(0)
+                self.car.backward(25)
+                time.sleep(0.8)
+                self.car.stop()
+                time.sleep(0.1)
+                # Turn away
+                turn_direction = random.choice([-1, 1])
+                self.car.set_dir_servo_angle(35 * turn_direction)
+                self.car.forward(25)
+                time.sleep(1.0)
+                self.car.set_dir_servo_angle(0)
+                self.car.stop()
+        elif obstacle_distance is not None and obstacle_distance < 0.4:  # 40cm threshold
+            # Obstacle close - stop and turn
             gray_print(f"Obstacle at {obstacle_distance:.2f}m - turning")
-            turn_direction = random.choice([-1, 1])
-            self._send_velocity(0, turn_direction * 0.8)  # Turn in place
+            if self.car:
+                self.car.stop()
+                turn_direction = random.choice([-1, 1])
+                self.car.set_dir_servo_angle(30 * turn_direction)
+                self.car.forward(20)
+                time.sleep(0.8)
+                self.car.set_dir_servo_angle(0)
+                self.car.stop()
         elif obstacle_distance is not None and obstacle_distance < 0.6:
             # Obstacle medium distance - slow down and slight turn
             turn_direction = random.choice([-1, 1])
@@ -2012,9 +2039,9 @@ def keyboard_control(controller: SLAMNavigationController):
     print("SLAM Navigation - Keyboard Control")
     print("="*60)
     print("\nCommands:")
-    print("  drive     - Arrow key driving mode")
-    print("  map       - Start mapping mode")
-    print("  explore   - Start autonomous exploration")
+    print("  drive     - Arrow key driving mode (manual)")
+    print("  map       - Autonomous mapping (builds map)")
+    print("  explore   - Autonomous exploration (uses map)")
     print("  go X Y    - Navigate to position (meters)")
     print("  patrol    - Start patrol with predefined waypoints")
     print("  stop      - Stop and idle")
