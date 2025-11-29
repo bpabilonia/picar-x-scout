@@ -530,11 +530,21 @@ class OccupancyGridMap:
         return cells
     
     def get_occupancy_grid(self) -> np.ndarray:
-        """Get occupancy grid as values 0-100 (probability %)."""
+        """Get occupancy grid as values -1 (unknown), 0-100 (probability %).
+        
+        Cells with log-odds close to 0 (never observed) are marked as -1 (unknown).
+        """
         with self.lock:
             # Convert log-odds to probability
             prob = 1.0 - 1.0 / (1.0 + np.exp(self.grid))
-            return (prob * 100).astype(np.uint8)
+            result = (prob * 100).astype(np.int8)
+            
+            # Mark cells with log-odds near 0 as unknown (-1)
+            # These are cells that haven't been observed enough
+            unknown_mask = np.abs(self.grid) < 0.1
+            result[unknown_mask] = -1
+            
+            return result
     
     def get_binary_map(self, threshold: float = 0.6) -> np.ndarray:
         """Get binary map (True = occupied)."""
@@ -1618,6 +1628,12 @@ class SLAMNavigationController:
         if not self.occupancy_map:
             return
         
+        # Check if map is mostly unknown (needs initial exploration)
+        occupancy = self.occupancy_map.get_occupancy_grid()
+        unknown_count = np.sum(occupancy < 0)
+        total_cells = occupancy.size
+        unknown_ratio = unknown_count / total_cells
+        
         # Find nearest frontier (boundary between known and unknown)
         frontier = self._find_frontier()
         
@@ -1628,8 +1644,13 @@ class SLAMNavigationController:
                 self.current_path = path
                 self._goto_step(scan)
             else:
-                # Random exploration
+                # Can't plan to frontier, do random exploration
                 self._random_exploration(scan)
+        elif unknown_ratio > 0.95:
+            # Map is mostly unknown - need to do initial random exploration
+            # to build up some known areas before frontier-based exploration works
+            gray_print(f"Map {unknown_ratio*100:.0f}% unknown - random exploration")
+            self._random_exploration(scan)
         else:
             print("Exploration complete - no more frontiers")
             self.set_mode(NavigationMode.IDLE)
@@ -1941,5 +1962,26 @@ def main():
 
 
 if __name__ == "__main__":
+    import warnings
+    import atexit
+    
+    # Suppress GPIO cleanup warnings that occur during Python shutdown
+    def suppress_gpio_warnings():
+        warnings.filterwarnings('ignore', message='.*GPIO.*')
+    
+    atexit.register(suppress_gpio_warnings)
+    
+    # Suppress lgpio errors during exit
+    import sys
+    _original_excepthook = sys.excepthook
+    
+    def _quiet_excepthook(exc_type, exc_value, exc_tb):
+        # Suppress lgpio.error during cleanup
+        if 'lgpio' in str(exc_type) or 'GPIO' in str(exc_value):
+            return
+        _original_excepthook(exc_type, exc_value, exc_tb)
+    
+    sys.excepthook = _quiet_excepthook
+    
     main()
 
