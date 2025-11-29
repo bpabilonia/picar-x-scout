@@ -106,10 +106,11 @@ except ImportError:
 # PiCar-X imports
 try:
     from picarx import Picarx
-    from robot_hat import Pin
+    from robot_hat import Pin, ADC
     PICARX_AVAILABLE = True
 except ImportError:
     PICARX_AVAILABLE = False
+    ADC = None
     print("Warning: PiCar-X library not available. Running in simulation mode.")
 
 # Local imports
@@ -161,6 +162,47 @@ PATROL_WAYPOINT_RADIUS = 0.3  # meters - how close to get to waypoint
 # Visualization
 VIZ_UPDATE_RATE = 10  # Hz
 VIZ_WINDOW_SIZE = (800, 800)
+
+
+# ============================================================================
+# Battery Monitoring
+# ============================================================================
+# Initialize battery ADC if available
+battery_adc = None
+if PICARX_AVAILABLE and ADC is not None:
+    try:
+        battery_adc = ADC("A4")
+    except:
+        pass
+
+def get_battery_info():
+    """
+    Read battery voltage and estimate percentage.
+    PiCar-X uses 2S Li-ion battery (7.4V nominal, 8.4V full, 6.4V empty).
+    The ADC reads through a voltage divider (3:1 ratio).
+    """
+    if battery_adc is None:
+        return None, None
+    
+    try:
+        # Read ADC value (0-4095 for 12-bit ADC, maps to 0-3.3V)
+        adc_value = battery_adc.read()
+        # Convert to actual voltage (3.3V reference, 3:1 voltage divider)
+        voltage = (adc_value / 4095.0) * 3.3 * 3
+        
+        # Estimate percentage based on 2S Li-ion discharge curve
+        # Full: 8.4V (100%), Nominal: 7.4V (50%), Empty: 6.4V (0%)
+        if voltage >= 8.4:
+            percentage = 100
+        elif voltage <= 6.4:
+            percentage = 0
+        else:
+            # Linear approximation between 6.4V and 8.4V
+            percentage = int((voltage - 6.4) / (8.4 - 6.4) * 100)
+        
+        return voltage, percentage
+    except Exception as e:
+        return None, None
 
 
 # ============================================================================
@@ -1413,6 +1455,13 @@ class SLAMNavigationController:
         print(f"  ROS Mode: {self.use_ros}")
         print(f"  LIDAR: {self.use_lidar}")
         print(f"  Visualization: {self.visualizer is not None}")
+        
+        # Display battery status
+        voltage, percentage = get_battery_info()
+        if voltage is not None:
+            battery_icon = "🔋" if percentage > 20 else "🪫"
+            print(f"  {battery_icon} Battery: {percentage}% ({voltage:.2f}V)")
+        
         print(f"{'='*60}\n")
     
     def start(self):
@@ -1626,6 +1675,8 @@ class SLAMNavigationController:
     def _explore_step(self, scan: Optional[ScanData]):
         """Autonomous exploration to map unknown areas."""
         if not self.occupancy_map:
+            # No map - just do random exploration with obstacle avoidance
+            self._random_exploration(scan)
             return
         
         # Check if map is mostly unknown (needs initial exploration)
@@ -1634,23 +1685,24 @@ class SLAMNavigationController:
         total_cells = occupancy.size
         unknown_ratio = unknown_count / total_cells
         
+        # If map is mostly unknown (>80%), use random exploration
+        # Don't try to plan paths when we don't have enough map data
+        if unknown_ratio > 0.80:
+            self._random_exploration(scan)
+            return
+        
         # Find nearest frontier (boundary between known and unknown)
         frontier = self._find_frontier()
         
         if frontier:
-            # Plan path to frontier
+            # Try to plan path to frontier
             path = self.planner.plan(self.current_pose, frontier)
             if path:
                 self.current_path = path
                 self._goto_step(scan)
             else:
-                # Can't plan to frontier, do random exploration
+                # Can't plan to frontier, do random exploration instead
                 self._random_exploration(scan)
-        elif unknown_ratio > 0.95:
-            # Map is mostly unknown - need to do initial random exploration
-            # to build up some known areas before frontier-based exploration works
-            gray_print(f"Map {unknown_ratio*100:.0f}% unknown - random exploration")
-            self._random_exploration(scan)
         else:
             print("Exploration complete - no more frontiers")
             self.set_mode(NavigationMode.IDLE)
@@ -1694,31 +1746,41 @@ class SLAMNavigationController:
         return nearest
     
     def _random_exploration(self, scan: Optional[ScanData]):
-        """Random walk for exploration."""
-        # Get obstacles from scan
-        obstacles = []
-        if scan:
-            for reading in scan.readings:
-                if reading.distance < 1.0:
-                    angle = self.current_pose.theta + reading.angle
-                    ox = self.current_pose.x + reading.distance * math.cos(angle)
-                    oy = self.current_pose.y + reading.distance * math.sin(angle)
-                    obstacles.append((ox, oy))
-        
-        # Use DWA for random goal
+        """Random walk for exploration - simple obstacle avoidance."""
         import random
-        random_angle = random.uniform(-math.pi, math.pi)
-        random_goal = Pose2D(
-            x=self.current_pose.x + 2.0 * math.cos(random_angle),
-            y=self.current_pose.y + 2.0 * math.sin(random_angle)
-        )
         
-        v, omega = self.dwa.compute_velocity(
-            self.current_pose, random_goal, obstacles,
-            self.current_v, self.current_omega
-        )
+        # Get distance from ultrasonic sensor
+        obstacle_distance = None
+        if scan and scan.readings:
+            # Find minimum distance in forward direction
+            for reading in scan.readings:
+                if abs(reading.angle) < 0.5:  # Forward-facing readings
+                    if obstacle_distance is None or reading.distance < obstacle_distance:
+                        obstacle_distance = reading.distance
         
-        self._send_velocity(v, omega)
+        # Also check directly from car sensor
+        if self.car and obstacle_distance is None:
+            dist_cm = self.car.get_distance()
+            if dist_cm > 0:
+                obstacle_distance = dist_cm / 100.0  # Convert to meters
+        
+        # Simple behavior: drive forward, turn if obstacle detected
+        if obstacle_distance is not None and obstacle_distance < 0.4:  # 40cm threshold
+            # Obstacle close - turn randomly
+            gray_print(f"Obstacle at {obstacle_distance:.2f}m - turning")
+            turn_direction = random.choice([-1, 1])
+            self._send_velocity(0, turn_direction * 0.8)  # Turn in place
+        elif obstacle_distance is not None and obstacle_distance < 0.6:
+            # Obstacle medium distance - slow down and slight turn
+            turn_direction = random.choice([-1, 1])
+            self._send_velocity(0.15, turn_direction * 0.3)
+        else:
+            # Path clear - drive forward with occasional random turns
+            if random.random() < 0.1:  # 10% chance to make a slight turn
+                omega = random.uniform(-0.3, 0.3)
+            else:
+                omega = 0
+            self._send_velocity(0.25, omega)  # Drive forward at 0.25 m/s
     
     def _compute_velocity_to_waypoint(self, waypoint: Pose2D, 
                                       scan: Optional[ScanData]) -> Tuple[float, float]:
@@ -1807,6 +1869,139 @@ class SLAMNavigationController:
 
 
 # ============================================================================
+# Arrow Key Drive Mode
+# ============================================================================
+MANUAL_DRIVE_SPEED = 30
+
+def get_key_nonblocking():
+    """Get a keypress without blocking. Returns None if no key pressed."""
+    import tty
+    import termios
+    import select
+    
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if rlist:
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                rlist2, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if rlist2:
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == '[':
+                        rlist3, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if rlist3:
+                            ch3 = sys.stdin.read(1)
+                            return '\x1b[' + ch3
+                        return '\x1b['
+                    return '\x1b' + ch2
+                return ch
+            return ch
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def manual_drive_mode(controller: SLAMNavigationController):
+    """Enter manual drive mode with arrow key controls."""
+    if not controller.car:
+        print("No car available for manual drive")
+        return
+    
+    print("\n" + "="*40)
+    print("🎮 MANUAL DRIVE MODE")
+    print("="*40)
+    print("  ↑  Forward")
+    print("  ↓  Backward")
+    print("  ←  Turn Left")
+    print("  →  Turn Right")
+    print("  SPACE  Stop")
+    print("  Q  Exit drive mode")
+    print("="*40)
+    print("Car keeps moving until SPACE or new direction.\n")
+    
+    # Stop any autonomous mode
+    prev_mode = controller.mode
+    controller.set_mode(NavigationMode.IDLE)
+    controller.car.stop()
+    controller.car.set_dir_servo_angle(0)
+    
+    drive_direction = None
+    steering_angle = 0
+    last_status = ""
+    
+    try:
+        while True:
+            key = get_key_nonblocking()
+            
+            if key:
+                if key == 'q' or key == 'Q':
+                    print("\n✓ Exiting drive mode")
+                    controller.car.stop()
+                    controller.car.set_dir_servo_angle(0)
+                    break
+                
+                elif key == '\x1b[A':  # Up arrow
+                    drive_direction = 'forward'
+                    steering_angle = 0
+                
+                elif key == '\x1b[B':  # Down arrow
+                    drive_direction = 'backward'
+                    steering_angle = 0
+                
+                elif key == '\x1b[D':  # Left arrow
+                    drive_direction = 'forward'
+                    steering_angle = 30
+                
+                elif key == '\x1b[C':  # Right arrow
+                    drive_direction = 'forward'
+                    steering_angle = -30
+                
+                elif key == ' ':  # Space
+                    drive_direction = None
+                    steering_angle = 0
+                
+                elif key == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt
+            
+            # Apply drive state
+            controller.car.set_dir_servo_angle(steering_angle)
+            
+            if drive_direction == 'forward':
+                controller.car.forward(MANUAL_DRIVE_SPEED)
+            elif drive_direction == 'backward':
+                controller.car.backward(MANUAL_DRIVE_SPEED)
+            else:
+                controller.car.stop()
+            
+            # Status display
+            if drive_direction == 'forward':
+                if steering_angle > 0:
+                    status = "↖️  Forward + Left "
+                elif steering_angle < 0:
+                    status = "↗️  Forward + Right"
+                else:
+                    status = "⬆️  Forward        "
+            elif drive_direction == 'backward':
+                status = "⬇️  Backward       "
+            else:
+                status = "⏹️  Stopped        "
+            
+            if status != last_status:
+                print(status, end='\r', flush=True)
+                last_status = status
+                
+    except KeyboardInterrupt:
+        print("\n✓ Drive interrupted")
+    finally:
+        controller.car.stop()
+        controller.car.set_dir_servo_angle(0)
+        print("Ready for commands.\n")
+
+
+# ============================================================================
 # Keyboard Control
 # ============================================================================
 def keyboard_control(controller: SLAMNavigationController):
@@ -1817,11 +2012,13 @@ def keyboard_control(controller: SLAMNavigationController):
     print("SLAM Navigation - Keyboard Control")
     print("="*60)
     print("\nCommands:")
+    print("  drive     - Arrow key driving mode")
     print("  map       - Start mapping mode")
     print("  explore   - Start autonomous exploration")
     print("  go X Y    - Navigate to position (meters)")
     print("  patrol    - Start patrol with predefined waypoints")
     print("  stop      - Stop and idle")
+    print("  scan      - Read ultrasonic sensor")
     print("  save      - Save map to file")
     print("  load      - Load map from file")
     print("  status    - Show current status")
@@ -1873,6 +2070,19 @@ def keyboard_control(controller: SLAMNavigationController):
             
             elif command == 'stop':
                 controller.set_mode(NavigationMode.IDLE)
+                if controller.car:
+                    controller.car.stop()
+            
+            elif command == 'drive':
+                manual_drive_mode(controller)
+            
+            elif command == 'scan':
+                # Test ultrasonic sensor
+                if controller.car:
+                    dist = controller.car.get_distance()
+                    print(f"Ultrasonic distance: {dist} cm")
+                else:
+                    print("No car available")
             
             elif command == 'save':
                 filename = parts[1] if len(parts) > 1 else "slam_map.json"
@@ -1891,6 +2101,13 @@ def keyboard_control(controller: SLAMNavigationController):
                 print(f"  Path waypoints: {len(controller.current_path)}")
                 if controller.occupancy_map:
                     print(f"  Map size: {controller.occupancy_map.width}x{controller.occupancy_map.height}")
+                # Battery status
+                voltage, percentage = get_battery_info()
+                if voltage is not None:
+                    battery_icon = "🔋" if percentage > 20 else "🪫"
+                    print(f"  {battery_icon} Battery: {percentage}% ({voltage:.2f}V)")
+                else:
+                    print(f"  🔋 Battery: Unable to read")
                 print()
             
             else:
