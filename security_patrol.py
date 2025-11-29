@@ -1122,17 +1122,23 @@ def get_key_nonblocking():
         rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
         if rlist:
             ch = sys.stdin.read(1)
-            # Check for escape sequence (arrow keys)
+            # Check for escape sequence (arrow keys send: ESC [ A/B/C/D)
             if ch == '\x1b':
-                # Check for more characters
-                rlist2, _, _ = select.select([sys.stdin], [], [], 0.01)
+                # Wait a bit longer for the rest of the escape sequence
+                rlist2, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if rlist2:
                     ch2 = sys.stdin.read(1)
                     if ch2 == '[':
-                        rlist3, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        # Read the direction character
+                        rlist3, _, _ = select.select([sys.stdin], [], [], 0.1)
                         if rlist3:
                             ch3 = sys.stdin.read(1)
                             return '\x1b[' + ch3
+                        # No third char, return what we have
+                        return '\x1b['
+                    # Not a bracket, return escape + char
+                    return '\x1b' + ch2
+                # Just escape key
                 return ch
             return ch
         return None
@@ -1226,7 +1232,7 @@ def manual_drive_mode():
                     status = "⏹️  Stopped          "
             
             if status != last_status:
-                print(status, end='\r')
+                print(status, end='\r', flush=True)
                 last_status = status
                 
     except KeyboardInterrupt:
